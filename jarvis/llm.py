@@ -28,16 +28,25 @@ def strip_thinking(text: str) -> str:
 
 
 class Ollama:
-    def __init__(self, base_url: str, model: str, timeout: float = 600.0):
+    def __init__(self, base_url: str, model: str, timeout: float = 600.0, think: bool = False):
         self.base_url = base_url
         self.model = model
+        # Les modèles "qui réfléchissent" (qwen3...) répondent bien plus vite sans cette phase.
+        self.think: bool | None = think
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def chat(self, messages: list[dict], *, json_mode: bool = False) -> str:
         payload: dict = {"model": self.model, "messages": messages, "stream": False}
         if json_mode:
             payload["format"] = "json"
+        if self.think is not None:
+            payload["think"] = self.think
         r = await self._client.post(f"{self.base_url}/api/chat", json=payload)
+        if r.status_code == 400 and "think" in payload:
+            # Ollama trop ancien ou modèle sans option de réflexion : on n'envoie plus le paramètre.
+            self.think = None
+            del payload["think"]
+            r = await self._client.post(f"{self.base_url}/api/chat", json=payload)
         r.raise_for_status()
         return strip_thinking(r.json()["message"]["content"])
 

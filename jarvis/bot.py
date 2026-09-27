@@ -15,13 +15,14 @@ from zoneinfo import ZoneInfo
 import httpx
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import TelegramError
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, PicklePersistence, filters
 
 from . import voice
 from .briefing import build_briefing
 from .config import Config
 from .llm import Ollama
-from .tasks import Task, TaskManager
+from .tasks import ACTIVE, Task, TaskManager
 
 log = logging.getLogger("jarvis")
 
@@ -43,6 +44,7 @@ HELP = """🤖 Jarvis — tes commandes
 /taches — liste des tâches
 /log <n> — dernières lignes d'une tâche
 /stop <n> — arrête une tâche
+/relancer <n> — relance une tâche (échouée, interrompue…)
 /get <fichier> — t'envoie un fichier du projet
 /briefing — météo + actus du jour
 /reset — oublie la conversation
@@ -72,7 +74,7 @@ def resolve_inside(base: Path, rel: str) -> Path | None:
 class Jarvis:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.llm = Ollama(cfg.ollama_url, cfg.chat_model)
+        self.llm = Ollama(cfg.ollama_url, cfg.chat_model, think=cfg.chat_think)
         self.tasks = TaskManager(cfg.agents, cfg.max_parallel_tasks, cfg.workspace / ".jarvis-logs")
         names = "|".join(re.escape(n) for n in cfg.agents)
         # "@claude fais ça", "claude: fais ça", "Claude, fais ça" (utile à la voix)
@@ -135,14 +137,22 @@ class Jarvis:
         await self.reply(update, reply)
 
     async def start_task(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, agent: str | None = None
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        prompt: str,
+        agent: str | None = None,
+        cwd: Path | None = None,
     ) -> None:
         agent = agent or self.current_agent(context)
-        cwd = self.project_dir(context)
+        cwd = cwd or self.project_dir(context)
         _ensure_git(cwd)
         chat_id = update.effective_chat.id
+        progress_job = None
 
         async def on_done(task: Task) -> None:
+            if progress_job:
+                progress_job.schedule_removal()
             icon = {"terminée": "✅", "échouée": "❌", "annulée": "🛑"}.get(task.status, "ℹ️")
             changes = _git_changes(task.cwd)
             text = (
@@ -158,11 +168,28 @@ class Jarvis:
                 await context.bot.send_message(chat_id, chunk)
 
         task = self.tasks.submit(prompt, cwd, on_done, agent)
-        await self.reply(
-            update,
+        status_msg = await update.effective_message.reply_text(
             f"🛠 Tâche #{task.id} lancée avec « {agent} » dans « {cwd.name} ».\n"
-            f"Je te préviens quand c'est fini (aucune limite de temps). /log {task.id} pour suivre.",
+            f"Je te préviens quand c'est fini (aucune limite de temps). /log {task.id} pour suivre."
         )
+        if self.cfg.progress_minutes and context.job_queue and task.status in ACTIVE:
+            # Ce message est mis à jour régulièrement (sans nouvelle notification sur le téléphone).
+            progress_job = context.job_queue.run_repeating(
+                self._progress, interval=self.cfg.progress_minutes * 60, data=(task, status_msg)
+            )
+
+    async def _progress(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        task, msg = context.job.data
+        if task.status not in ACTIVE:
+            context.job.schedule_removal()
+            return
+        text = f"🛠 Tâche #{task.id} ({task.agent}, {task.cwd.name}) — {task.status} depuis {task.duration}"
+        if last := task.last_line():
+            text += f"\n⏳ {last}"
+        try:
+            await msg.edit_text(text)
+        except TelegramError:
+            pass  # message identique ou supprimé : sans importance
 
     # ---------- commandes ----------
 
@@ -253,6 +280,17 @@ class Jarvis:
         ok = bool(task) and self.tasks.cancel(task.id)
         await self.reply(update, f"🛑 Tâche #{task.id} arrêtée." if ok else "Rien à arrêter.")
 
+    async def cmd_retry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        task = self._task_from_args(context)
+        if not task:
+            await self.reply(update, "Tâche introuvable.")
+            return
+        if task.status in ACTIVE:
+            await self.reply(update, f"La tâche #{task.id} est encore {task.status}.")
+            return
+        agent = task.agent if task.agent in self.cfg.agents else self.current_agent(context)
+        await self.start_task(update, context, task.prompt, agent, task.cwd)
+
     async def cmd_get(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
             await self.reply(update, "Usage : /get <chemin/dans/le/projet>")
@@ -292,6 +330,18 @@ class Jarvis:
         await self.reply(update, f"🎙 « {text} »")
         await self.handle_text(update, context, text)
 
+    async def _on_startup(self, app: Application) -> None:
+        if not self.tasks.interrupted:
+            return
+        lines = [f"#{t.id} ({t.agent}, {t.cwd.name}) : {t.prompt[:60]}" for t in self.tasks.interrupted]
+        text = "⚠️ Jarvis a redémarré, ces tâches ont été interrompues :\n" + "\n".join(lines)
+        text += "\n\n/relancer <n> pour en reprendre une."
+        for user_id in self.cfg.allowed_user_ids:
+            try:
+                await app.bot.send_message(user_id, text)
+            except TelegramError:
+                log.warning("Impossible de prévenir %s des tâches interrompues", user_id)
+
     async def daily_briefing(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = await build_briefing(self.cfg, self.llm)
         for user_id in self.cfg.allowed_user_ids:
@@ -301,7 +351,16 @@ class Jarvis:
     # ---------- assemblage ----------
 
     def build_app(self) -> Application:
-        app = Application.builder().token(self.cfg.telegram_token).concurrent_updates(True).build()
+        # Projet actif, agent choisi et conversation survivent aux redémarrages.
+        persistence = PicklePersistence(filepath=self.cfg.workspace / ".jarvis-state.pickle")
+        app = (
+            Application.builder()
+            .token(self.cfg.telegram_token)
+            .concurrent_updates(True)
+            .persistence(persistence)
+            .post_init(self._on_startup)
+            .build()
+        )
         auth = self.authorized
         app.add_handler(CommandHandler("id", self.cmd_id))
         for names, fn in [
@@ -313,6 +372,7 @@ class Jarvis:
             (["taches", "tasks"], self.cmd_tasks),
             (["log"], self.cmd_log),
             (["stop"], self.cmd_stop),
+            (["relancer", "retry"], self.cmd_retry),
             (["get"], self.cmd_get),
             (["reset"], self.cmd_reset),
             (["briefing"], self.cmd_briefing),

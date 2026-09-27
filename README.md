@@ -25,11 +25,15 @@ Pas besoin d'ouvrir de port sur ta box : le bot va chercher les messages chez Te
 | 🎙 un message vocal | Le transcrit en local puis le traite pareil |
 | `/briefing` (ou automatiquement chaque matin) | Météo + résumé des actus |
 | `/projet site-perso` puis des demandes | Travaille dans ce dossier, garde l'historique git |
-| `/taches`, `/log 3`, `/stop 3`, `/get index.html` | Suivre, arrêter, récupérer un fichier |
+| `/taches`, `/log 3`, `/stop 3`, `/relancer 3`, `/get index.html` | Suivre, arrêter, relancer, récupérer un fichier |
 | `/claude <tâche>` ou « Claude, … » | Utilise Claude Code (ton abonnement) au lieu du modèle gratuit |
 
 Jarvis choisit seul entre « répondre » et « agir » (`AUTO_ROUTE=1`). Tu peux forcer avec `/ask` ou `/do`.
 Les tâches n'ont **aucune limite de durée**.
+Pendant une tâche, le message « 🛠 Tâche lancée » se met à jour toutes les 5 minutes avec ce que fait
+l'agent (sans te notifier à chaque fois). Le projet actif, l'agent choisi, la conversation et l'historique
+des tâches sont conservés quand le PC ou Jarvis redémarre ; si une tâche a été coupée, Jarvis te prévient
+au démarrage et `/relancer` la reprend.
 
 ## Installation express : Fedora + GPU AMD (ta config)
 

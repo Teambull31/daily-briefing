@@ -33,7 +33,7 @@ def _ids(raw: str) -> frozenset[int]:
 AGENT_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 # Noms déjà pris par les commandes du bot : un agent ne peut pas s'appeler comme elles.
 RESERVED_NAMES = frozenset(
-    "start aide help ask do projet project taches tasks log stop get reset briefing id agent agents cmd".split()
+    "start aide help ask do projet project taches tasks log stop get reset briefing id agent agents relancer retry cmd".split()
 )
 
 
@@ -66,6 +66,8 @@ class Config:
     workspace: Path = Path.home() / "jarvis-workspace"
     max_parallel_tasks: int = 1
     auto_route: bool = True
+    chat_think: bool = False
+    progress_minutes: int = 5
     whisper_model: str = "small"
     timezone: str = "Europe/Paris"
     briefing_time: str = ""  # "07:30" pour un briefing quotidien automatique, vide = désactivé
@@ -95,6 +97,8 @@ class Config:
             workspace=Path(env.get("WORKSPACE", str(cls.workspace))).expanduser(),
             max_parallel_tasks=max(1, int(env.get("MAX_PARALLEL_TASKS", "1"))),
             auto_route=env.get("AUTO_ROUTE", "1") not in ("0", "false", "no"),
+            chat_think=env.get("CHAT_THINK", "0") in ("1", "true", "yes"),
+            progress_minutes=max(0, int(env.get("PROGRESS_MINUTES", "5"))),
             whisper_model=env.get("WHISPER_MODEL", cls.whisper_model),
             timezone=env.get("TIMEZONE", cls.timezone),
             briefing_time=env.get("BRIEFING_TIME", "").strip(),

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
+import logging
 import os
 import re
 import shlex
@@ -22,6 +24,9 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 PROMPT_TOKEN = "{prompt}"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+ACTIVE = ("en attente", "en cours")
+log = logging.getLogger("jarvis.tasks")
 
 # Si l'une de ces variables existe, Claude Code facture à l'API au lieu d'utiliser
 # l'abonnement (compte connecté via `claude login`) : on les retire pour lui.
@@ -30,6 +35,7 @@ API_BILLING_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 def agent_env(argv: list[str]) -> dict[str, str]:
     env = dict(os.environ)
+    env["NO_COLOR"] = "1"  # sorties lisibles sur Telegram (pas de codes couleur)
     exe = re.split(r"[\\/]", argv[0])[-1].lower()  # marche pour les chemins Windows et Unix
     if exe.rsplit(".", 1)[0] == "claude":
         for var in API_BILLING_VARS:
@@ -60,7 +66,7 @@ class Task:
     cwd: Path
     log_path: Path
     agent: str = ""
-    status: str = "en attente"  # en attente | en cours | terminée | échouée | annulée
+    status: str = "en attente"  # en attente | en cours | terminée | échouée | annulée | interrompue
     returncode: int | None = None
     started: float | None = None
     finished: float | None = None
@@ -80,7 +86,26 @@ class Task:
             data = self.log_path.read_text(encoding="utf-8", errors="replace")
         except FileNotFoundError:
             return ""
-        return data[-max_chars:]
+        clean = ANSI_RE.sub("", data[-(max_chars * 2):]).replace("\r\n", "\n").replace("\r", "\n")
+        return clean[-max_chars:]
+
+    def last_line(self, max_chars: int = 200) -> str:
+        lines = [line.strip() for line in self.tail(4000).splitlines() if line.strip()]
+        return lines[-1][:max_chars] if lines else ""
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "prompt": self.prompt, "cwd": str(self.cwd), "log_path": str(self.log_path),
+            "agent": self.agent, "status": self.status, "returncode": self.returncode,
+            "started": self.started, "finished": self.finished,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Task":
+        task = cls(d["id"], d["prompt"], Path(d["cwd"]), Path(d["log_path"]), d.get("agent", ""))
+        task.status, task.returncode = d.get("status", "terminée"), d.get("returncode")
+        task.started, task.finished = d.get("started"), d.get("finished")
+        return task
 
 
 Notifier = Callable[[Task], Awaitable[None]]
@@ -91,7 +116,11 @@ class TaskManager:
         self.agents = {"local": agents} if isinstance(agents, str) else dict(agents)
         self.logs_dir = logs_dir
         self.tasks: dict[int, Task] = {}
-        self._ids = itertools.count(1)
+        # Historique conservé entre deux redémarrages (/taches, /log continuent de marcher).
+        self.state_file = logs_dir / "taches.json" if logs_dir else None
+        self.interrupted: list[Task] = []  # tâches coupées par le dernier arrêt de Jarvis
+        self._load()
+        self._ids = itertools.count(max(self.tasks, default=0) + 1)
         self._sem = asyncio.Semaphore(max_parallel)
         self._runners: set[asyncio.Task] = set()
 
@@ -105,6 +134,7 @@ class TaskManager:
         task_id = next(self._ids)
         task = Task(task_id, prompt, cwd, logs_dir / f"tache-{task_id}.log", agent)
         self.tasks[task_id] = task
+        self._save()
         runner = asyncio.create_task(self._run(task, on_done))
         self._runners.add(runner)
         runner.add_done_callback(self._runners.discard)
@@ -116,6 +146,7 @@ class TaskManager:
                 return
             task.status = "en cours"
             task.started = time.time()
+            self._save()
             try:
                 argv = build_argv(self.agents[task.agent], task.prompt)
                 with task.log_path.open("wb") as log:
@@ -140,20 +171,51 @@ class TaskManager:
             finally:
                 task.finished = time.time()
                 task.proc = None
+                self._save()
         if on_done:
-            await on_done(task)
+            try:
+                await on_done(task)
+            except Exception:  # ex. Telegram injoignable : ne pas perdre la tâche pour autant
+                log.exception("Notification de fin de la tâche #%s impossible", task.id)
 
     def cancel(self, task_id: int) -> bool:
         task = self.tasks.get(task_id)
         if not task or task.status not in ("en attente", "en cours"):
             return False
         task.status = "annulée"
+        self._save()
         if task.proc and task.proc.returncode is None:
             _kill_tree(task.proc)
         return True
 
     def recent(self, n: int = 10) -> list[Task]:
         return sorted(self.tasks.values(), key=lambda t: t.id, reverse=True)[:n]
+
+    def running(self) -> list[Task]:
+        return [t for t in self.tasks.values() if t.status in ACTIVE]
+
+    def _load(self) -> None:
+        if not self.state_file or not self.state_file.is_file():
+            return
+        try:
+            for d in json.loads(self.state_file.read_text(encoding="utf-8")):
+                task = Task.from_dict(d)
+                if task.status in ACTIVE:  # Jarvis s'est arrêté pendant la tâche
+                    task.status = "interrompue"
+                    self.interrupted.append(task)
+                self.tasks[task.id] = task
+        except (ValueError, KeyError, TypeError):
+            log.warning("Historique des tâches illisible, ignoré : %s", self.state_file)
+        if self.interrupted:
+            self._save()
+
+    def _save(self, keep: int = 200) -> None:
+        if not self.state_file:
+            return
+        data = [t.to_dict() for t in self.recent(keep)]
+        tmp = self.state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(self.state_file)
 
 
 def _new_process_group() -> dict:

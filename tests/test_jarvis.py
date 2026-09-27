@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -164,3 +165,97 @@ def test_config_from_env(tmp_path: Path, monkeypatch):
     assert cfg.telegram_token == "abc"
     assert cfg.allowed_user_ids == {1, 2}
     assert cfg.briefing_time == "07:30"
+
+
+def test_task_history_survives_restart(tmp_path: Path):
+    async def scenario():
+        tm = TaskManager(f'{PY} -c "print(1)"', logs_dir=tmp_path)
+        done = tm.submit("fini", tmp_path)
+        await asyncio.gather(*tm._runners)
+        return done
+
+    done = asyncio.run(scenario())
+    # Simule un arrêt brutal pendant une 2e tâche
+    state = tmp_path / "taches.json"
+    data = json.loads(state.read_text())
+    data.insert(0, {**data[0], "id": 2, "prompt": "coupée", "status": "en cours"})
+    state.write_text(json.dumps(data))
+
+    reloaded = TaskManager("echo", logs_dir=tmp_path)
+    assert reloaded.tasks[done.id].status == "terminée"
+    assert [t.id for t in reloaded.interrupted] == [2]
+    assert reloaded.tasks[2].status == "interrompue"
+    assert next(reloaded._ids) == 3
+    # Au redémarrage suivant, elle n'est plus signalée une 2e fois
+    assert TaskManager("echo", logs_dir=tmp_path).interrupted == []
+
+
+def test_tail_strips_ansi_and_carriage_returns(tmp_path: Path):
+    from jarvis.tasks import Task
+
+    log = tmp_path / "t.log"
+    log.write_bytes(b"\x1b[32mvert\x1b[0m\r\n10%\r50%\r100%\n\x1b]0;titre\x07fin\n")
+    task = Task(1, "p", tmp_path, log)
+    assert task.tail() == "vert\n10%\n50%\n100%\nfin\n"
+    assert task.last_line() == "fin"
+
+
+def test_ollama_think_flag_and_fallback():
+    import httpx
+
+    from jarvis.llm import Ollama
+
+    seen = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        seen.append("think" in body)
+        if "think" in body:
+            return httpx.Response(400, json={"error": "unknown field think"})
+        return httpx.Response(200, json={"message": {"content": "ok"}})
+
+    async def scenario():
+        o = Ollama("http://x", "m")
+        o._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return await o.ask("a"), await o.ask("b")
+
+    assert asyncio.run(scenario()) == ("ok", "ok")
+    assert seen == [True, False, False]  # un seul essai avec "think", puis plus jamais
+
+
+def test_bot_builds_with_persistence(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "1:x")
+    monkeypatch.setenv("ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    app = Jarvis(Config.from_env()).build_app()
+    commands = {c for h in app.handlers[0] for c in getattr(h, "commands", ())}
+    assert {"relancer", "local", "briefing"} <= commands
+    assert app.persistence is not None
+
+
+def test_progress_updates_status_message(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    from jarvis.tasks import Task
+
+    monkeypatch.setenv("TELEGRAM_TOKEN", "1:x")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    jarvis = Jarvis(Config.from_env())
+    log = tmp_path / "t.log"
+    log.write_text("étape 1\nécriture de index.html\n")
+    task = Task(7, "site", tmp_path, log, "local", status="en cours", started=0.0)
+
+    class Msg:
+        text = None
+
+        async def edit_text(self, text):
+            self.text = text
+
+    msg, removed = Msg(), []
+    job = SimpleNamespace(data=(task, msg), schedule_removal=lambda: removed.append(True))
+    asyncio.run(jarvis._progress(SimpleNamespace(job=job)))
+    assert "#7" in msg.text and "écriture de index.html" in msg.text and not removed
+
+    task.status = "terminée"
+    asyncio.run(jarvis._progress(SimpleNamespace(job=job)))
+    assert removed == [True]
