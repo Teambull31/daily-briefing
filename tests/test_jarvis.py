@@ -259,3 +259,128 @@ def test_progress_updates_status_message(monkeypatch, tmp_path: Path):
     task.status = "terminée"
     asyncio.run(jarvis._progress(SimpleNamespace(job=job)))
     assert removed == [True]
+
+
+# ---------- mémoire, rappels, fichiers ----------
+
+from datetime import datetime, timedelta  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+from jarvis.memory import REMEMBER_PREFIX, Store, parse_reminder  # noqa: E402
+
+NOW = datetime(2026, 9, 28, 10, 0, tzinfo=ZoneInfo("Europe/Paris"))  # un lundi
+
+
+@pytest.mark.parametrize(
+    "text, expected_when, expected_what",
+    [
+        ("rappelle-moi dans 20 minutes de sortir le linge", NOW + timedelta(minutes=20), "sortir le linge"),
+        ("Rappelle moi demain à 9h d'appeler le garage", NOW.replace(day=29, hour=9), "appeler le garage"),
+        ("rappelle-moi à 18h30 de faire les courses", NOW.replace(hour=18, minute=30), "faire les courses"),
+        ("rappelle-moi à 8h de prendre mes médicaments", NOW.replace(day=29, hour=8), "prendre mes médicaments"),
+        ("rappel: ce soir réunion parents", NOW.replace(hour=19), "réunion parents"),
+        ("rappelle-moi après-demain à 14 heures qu'il faut payer", NOW.replace(day=30, hour=14), "il faut payer"),
+        ("rappelle-moi dans 2 h : relancer le build", NOW + timedelta(hours=2), "relancer le build"),
+    ],
+)
+def test_parse_reminder(text, expected_when, expected_what):
+    assert parse_reminder(text, NOW) == (expected_when, expected_what)
+
+
+@pytest.mark.parametrize("text", ["rappelle-moi lundi prochain de voir Paul", "rappelle-moi à 25h de x"])
+def test_parse_reminder_unknown_goes_to_llm(text):
+    assert parse_reminder(text, NOW) is None
+
+
+def test_remember_prefix():
+    assert REMEMBER_PREFIX.sub("", "Souviens-toi que je code en Python", count=1) == "je code en Python"
+    assert not REMEMBER_PREFIX.match("note ça dans un fichier")
+
+
+def test_store_persists_notes_and_reminders(tmp_path: Path):
+    store = Store(tmp_path / "m.json")
+    store.add_note("mon VPS est chez Hetzner")
+    r1 = store.add_reminder(1, NOW + timedelta(hours=2), "b")
+    r2 = store.add_reminder(1, NOW + timedelta(hours=1), "a")
+    again = Store(tmp_path / "m.json")
+    assert again.notes == ["mon VPS est chez Hetzner"]
+    assert [r["text"] for r in again.reminders] == ["a", "b"]  # triés par date
+    assert again.remove_reminder(r1["id"]) and not again.remove_reminder(999)
+    assert again.add_reminder(1, NOW, "c")["id"] == r2["id"] + 1
+    assert again.remove_note(1) == "mon VPS est chez Hetzner" and again.remove_note(1) is None
+
+
+def test_corrupted_store_is_kept_aside(tmp_path: Path):
+    (tmp_path / "m.json").write_text("{pas du json")
+    assert Store(tmp_path / "m.json").notes == []
+    assert (tmp_path / "m.corrompu").exists()
+
+
+def test_llm_parse_when_and_router_actions():
+    import httpx
+
+    from jarvis.llm import Ollama
+
+    answers = iter(['{"datetime": "2026-10-05T09:00", "texte": "voir Paul"}', '{"datetime": null}',
+                    '{"action": "reminder"}', '{"action": "delete_everything"}'])
+
+    def handler(req):
+        return httpx.Response(200, json={"message": {"content": next(answers)}})
+
+    async def scenario():
+        o = Ollama("http://x", "m")
+        o._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return (await o.parse_when("lundi prochain voir Paul", NOW), await o.parse_when("un jour", NOW),
+                await o.route("rappelle-moi…"), await o.route("x"))
+
+    when, none, action, fallback = asyncio.run(scenario())
+    assert when == (datetime(2026, 10, 5, 9, 0, tzinfo=NOW.tzinfo), "voir Paul")
+    assert none is None and action == "reminder" and fallback == "chat"
+
+
+def test_assistant_context_includes_date_and_notes(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "1:x")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    jarvis = Jarvis(Config.from_env())
+    jarvis.store.add_note("je m'appelle Max")
+    ctx = jarvis.assistant_context()
+    assert "Nous sommes le" in ctx and "- je m'appelle Max" in ctx
+
+
+def test_file_helpers(tmp_path: Path):
+    from jarvis.bot import _safe_filename, _unique_path
+
+    assert _safe_filename("../../etc/pass wd?.txt") == "pass wd_.txt"
+    assert _safe_filename("...") == "fichier"
+    (tmp_path / "a.txt").write_text("x")
+    assert _unique_path(tmp_path / "a.txt").name == "a-1.txt"
+
+
+def test_reminder_flow_end_to_end(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TELEGRAM_TOKEN", "1:x")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    jarvis = Jarvis(Config.from_env())
+    replies, sent, scheduled = [], [], []
+
+    async def reply_text(text):
+        replies.append(text)
+
+    async def send_message(chat_id, text):
+        sent.append((chat_id, text))
+
+    update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply_text),
+                             effective_chat=SimpleNamespace(id=42))
+    job_queue = SimpleNamespace(run_once=lambda cb, when, data, name: scheduled.append((cb, when, data, name)))
+    context = SimpleNamespace(job_queue=job_queue, chat_data={}, bot=SimpleNamespace(send_message=send_message))
+
+    asyncio.run(jarvis.handle_text(update, context, "rappelle-moi dans 10 minutes de sortir le chien"))
+    assert "C'est noté" in replies[-1] and "sortir le chien" in replies[-1]
+    callback, when, rid, name = scheduled[0]
+    assert when.tzinfo is not None and name == f"rappel-{rid}"
+
+    context.job = SimpleNamespace(data=rid)
+    asyncio.run(callback(context))
+    assert sent == [(42, "⏰ Rappel : sortir le chien")]
+    assert jarvis.store.reminders == []

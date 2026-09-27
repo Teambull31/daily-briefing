@@ -27,6 +27,9 @@ Pas besoin d'ouvrir de port sur ta box : le bot va chercher les messages chez Te
 | `/projet site-perso` puis des demandes | Travaille dans ce dossier, garde l'historique git |
 | `/taches`, `/log 3`, `/stop 3`, `/relancer 3`, `/get index.html` | Suivre, arrêter, relancer, récupérer un fichier |
 | `/claude <tâche>` ou « Claude, … » | Utilise Claude Code (ton abonnement) au lieu du modèle gratuit |
+| « Rappelle-moi demain à 9h d'appeler le garage » | Rappel programmé (`/rappels` pour la liste) |
+| « Souviens-toi que je code surtout en Python » | Retenu durablement, utilisé dans les réponses (`/memoire`) |
+| 📎 Une photo ou un fichier (avec ou sans légende) | Rangé dans `inbox/` du projet ; la légende devient une demande |
 
 Jarvis choisit seul entre « répondre » et « agir » (`AUTO_ROUTE=1`). Tu peux forcer avec `/ask` ou `/do`.
 Les tâches n'ont **aucune limite de durée**.
@@ -34,6 +37,11 @@ Pendant une tâche, le message « 🛠 Tâche lancée » se met à jour toutes l
 l'agent (sans te notifier à chaque fois). Le projet actif, l'agent choisi, la conversation et l'historique
 des tâches sont conservés quand le PC ou Jarvis redémarre ; si une tâche a été coupée, Jarvis te prévient
 au démarrage et `/relancer` la reprend.
+
+Les rappels comprennent « dans 20 min », « à 18h30 », « ce soir », « demain à 9h », « après-demain à 14 heures »
+instantanément ; pour le reste (« lundi prochain », « le 3 à midi »), c'est l'IA locale qui lit la date.
+Un rappel prévu pendant que le PC était éteint est envoyé dès le redémarrage, marqué « en retard ».
+Jarvis connaît aussi la date et l'heure du jour, et tout ce que tu lui as demandé de retenir.
 
 ## Installation express : Fedora + GPU AMD (ta config)
 

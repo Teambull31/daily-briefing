@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime
 from datetime import time as dtime
 from functools import wraps
 from pathlib import Path
@@ -21,7 +22,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from . import voice
 from .briefing import build_briefing
 from .config import Config
-from .llm import Ollama
+from .llm import WEEKDAYS, Ollama
+from .memory import REMEMBER_PREFIX, REMINDER_PREFIX, Store, parse_reminder
 from .tasks import ACTIVE, Task, TaskManager
 
 log = logging.getLogger("jarvis")
@@ -47,10 +49,17 @@ HELP = """🤖 Jarvis — tes commandes
 /relancer <n> — relance une tâche (échouée, interrompue…)
 /get <fichier> — t'envoie un fichier du projet
 /briefing — météo + actus du jour
+/rappel <quand + quoi> — ex : /rappel demain à 9h appeler le garage
+/rappels — rappels prévus (/effacer_rappel <n>)
+/note <info> — je retiens une info sur toi (/memoire, /oublie <n>)
 /reset — oublie la conversation
 /id — ton identifiant Telegram
 
-🎙 Les messages vocaux marchent aussi (si faster-whisper est installé)."""
+🎙 Les messages vocaux marchent aussi (si faster-whisper est installé).
+📎 Envoie un fichier ou une photo : il est rangé dans le projet actif (dossier inbox/).
+   Avec une légende, je traite la légende comme une demande sur ce fichier.
+
+Tu peux aussi parler naturellement : « rappelle-moi dans 20 min de… », « souviens-toi que… »."""
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -80,8 +89,21 @@ class Jarvis:
         # "@claude fais ça", "claude: fais ça", "Claude, fais ça" (utile à la voix)
         self._agent_prefix = re.compile(rf"^\s*(?:@({names})\b[\s,:]*|({names})\s*[,:]\s*)(.+)$", re.I | re.S)
         cfg.workspace.mkdir(parents=True, exist_ok=True)
+        self.store = Store(cfg.workspace / ".jarvis-memoire.json")
+        self.tz = ZoneInfo(cfg.timezone)
 
     # ---------- utilitaires ----------
+
+    def now(self) -> datetime:
+        return datetime.now(self.tz)
+
+    def assistant_context(self) -> str:
+        """Date du jour + ce que Jarvis sait de l'utilisateur, ajoutés à chaque conversation."""
+        now = self.now()
+        text = f"Nous sommes le {WEEKDAYS[now.weekday()]} {now:%d/%m/%Y}, il est {now:%H:%M}."
+        if self.store.notes:
+            text += "\nCe que tu sais sur l'utilisateur :\n" + "\n".join(f"- {n}" for n in self.store.notes)
+        return text
 
     def authorized(self, handler):
         @wraps(handler)
@@ -117,18 +139,66 @@ class Jarvis:
             agent = (match.group(1) or match.group(2)).lower()
             await self.start_task(update, context, match.group(3).strip(), agent)
             return
+        if REMINDER_PREFIX.match(text):
+            await self.create_reminder(update, context, text)
+            return
+        if REMEMBER_PREFIX.match(text):
+            await self.remember(update, REMEMBER_PREFIX.sub("", text, count=1))
+            return
         if self.cfg.auto_route:
             await update.effective_chat.send_action(ChatAction.TYPING)
-            if await self.llm.route(text) == "task":
+            action = await self.llm.route(text)
+            if action == "task":
                 await self.start_task(update, context, text)
                 return
+            if action == "reminder":
+                await self.create_reminder(update, context, text)
+                return
+            if action == "remember":
+                await self.remember(update, text)
+                return
         await self.answer(update, context, text)
+
+    # ---------- mémoire et rappels ----------
+
+    async def remember(self, update: Update, text: str) -> None:
+        text = text.strip(" .")
+        if not text:
+            await self.reply(update, "Que dois-je retenir ?")
+            return
+        self.store.add_note(text)
+        await self.reply(update, f"🧠 Retenu : {text}\n(/memoire pour tout voir)")
+
+    async def create_reminder(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        now = self.now()
+        parsed = parse_reminder(text, now) or await self.llm.parse_when(text, now)
+        if not parsed:
+            await self.reply(
+                update,
+                "⏰ Je n'ai pas compris quand. Exemples : « rappelle-moi dans 20 min de… », "
+                "« rappelle-moi demain à 9h de… », « rappelle-moi à 18h30 de… ».",
+            )
+            return
+        when, what = parsed
+        reminder = self.store.add_reminder(update.effective_chat.id, when, what)
+        self._schedule_reminder(context.job_queue, reminder)
+        await self.reply(update, f"⏰ C'est noté pour {_fmt_when(when)} : {what}")
+
+    def _schedule_reminder(self, job_queue, reminder: dict) -> None:
+        when = datetime.fromisoformat(reminder["when"])
+        job_queue.run_once(self._fire_reminder, when=when, data=reminder["id"], name=f"rappel-{reminder['id']}")
+
+    async def _fire_reminder(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        reminder = next((r for r in self.store.reminders if r["id"] == context.job.data), None)
+        if reminder:
+            await context.bot.send_message(reminder["chat_id"], f"⏰ Rappel : {reminder['text']}")
+            self.store.remove_reminder(reminder["id"])
 
     async def answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         history: list[dict] = context.chat_data.setdefault("history", [])
         await update.effective_chat.send_action(ChatAction.TYPING)
         try:
-            reply = await self.llm.ask(text, history)
+            reply = await self.llm.ask(text, history, self.assistant_context())
         except httpx.HTTPError as exc:
             await self.reply(update, f"⚠️ Ollama ne répond pas ({exc.__class__.__name__}). Est-il lancé ?")
             return
@@ -239,7 +309,9 @@ class Jarvis:
 
     async def cmd_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
-            existing = sorted(p.name for p in self.cfg.workspace.iterdir() if p.is_dir() and not p.name.startswith("."))
+            existing = sorted(
+                p.name for p in self.cfg.workspace.iterdir() if p.is_dir() and not p.name.startswith(".")
+            )
             await self.reply(
                 update,
                 f"📁 Projet actuel : {self.project_dir(context).name}\n"
@@ -273,7 +345,8 @@ class Jarvis:
         if not task:
             await self.reply(update, "Tâche introuvable.")
             return
-        await self.reply(update, f"📜 #{task.id} [{task.status}, {task.duration}]\n\n{task.tail(3500) or '(rien encore)'}")
+        header = f"📜 #{task.id} [{task.status}, {task.duration}]"
+        await self.reply(update, f"{header}\n\n{task.tail(3500) or '(rien encore)'}")
 
     async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         task = self._task_from_args(context)
@@ -290,6 +363,68 @@ class Jarvis:
             return
         agent = task.agent if task.agent in self.cfg.agents else self.current_agent(context)
         await self.start_task(update, context, task.prompt, agent, task.cwd)
+
+    async def cmd_reminder(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await self.reply(update, "Usage : /rappel demain à 9h appeler le garage")
+            return
+        await self.create_reminder(update, context, " ".join(context.args))
+
+    async def cmd_reminders(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        reminders = self.store.reminders
+        if not reminders:
+            await self.reply(update, "Aucun rappel prévu.")
+            return
+        lines = [f"{r['id']}. {_fmt_when(datetime.fromisoformat(r['when']))} : {r['text']}" for r in reminders]
+        lines.append("\n/effacer_rappel <n> pour en supprimer un.")
+        await self.reply(update, "⏰ Rappels :\n" + "\n".join(lines))
+
+    async def cmd_delete_reminder(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args or not context.args[0].isdigit():
+            await self.reply(update, "Usage : /effacer_rappel <n> (voir /rappels)")
+            return
+        rid = int(context.args[0])
+        for job in context.job_queue.get_jobs_by_name(f"rappel-{rid}"):
+            job.schedule_removal()
+        ok = self.store.remove_reminder(rid)
+        await self.reply(update, f"🗑 Rappel {rid} supprimé." if ok else "Rappel introuvable.")
+
+    async def cmd_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.remember(update, " ".join(context.args))
+
+    async def cmd_memory(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.store.notes:
+            await self.reply(update, "🧠 Je ne sais rien sur toi encore. Dis « souviens-toi que … » ou /note …")
+            return
+        lines = [f"{i}. {n}" for i, n in enumerate(self.store.notes, 1)]
+        await self.reply(update, "🧠 Ce que je sais :\n" + "\n".join(lines) + "\n\n/oublie <n> pour effacer.")
+
+    async def cmd_forget(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        index = int(context.args[0]) if context.args and context.args[0].isdigit() else 0
+        removed = self.store.remove_note(index)
+        await self.reply(update, f"🗑 Oublié : {removed}" if removed else "Usage : /oublie <n> (voir /memoire)")
+
+    async def on_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if msg.photo:
+            media, name = msg.photo[-1], f"photo-{self.now():%Y%m%d-%H%M%S}.jpg"
+        else:
+            media, name = msg.document, _safe_filename(msg.document.file_name or "fichier")
+        inbox = self.project_dir(context) / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        target = _unique_path(inbox / name)
+        try:
+            tg_file = await media.get_file()
+            await tg_file.download_to_drive(target)
+        except TelegramError as exc:  # ex. fichier > 20 Mo (limite des bots Telegram)
+            await self.reply(update, f"📎 Téléchargement impossible : {exc}")
+            return
+        rel = target.relative_to(self.project_dir(context))
+        if msg.caption:
+            await self.handle_text(update, context, f"{msg.caption}\n\n(Fichier joint : {rel})")
+        else:
+            where = f"{self.project_dir(context).name}/{rel}"
+            await self.reply(update, f"📎 Enregistré dans {where}. Dis-moi quoi en faire.")
 
     async def cmd_get(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
@@ -331,6 +466,20 @@ class Jarvis:
         await self.handle_text(update, context, text)
 
     async def _on_startup(self, app: Application) -> None:
+        # Rappels : on reprogramme ceux à venir, on envoie ceux manqués pendant que le PC était éteint.
+        now = self.now()
+        for reminder in self.store.reminders:
+            when = datetime.fromisoformat(reminder["when"])
+            if when > now:
+                self._schedule_reminder(app.job_queue, reminder)
+                continue
+            try:
+                await app.bot.send_message(
+                    reminder["chat_id"], f"⏰ Rappel (en retard, prévu {_fmt_when(when)}) : {reminder['text']}"
+                )
+                self.store.remove_reminder(reminder["id"])
+            except TelegramError:
+                log.warning("Rappel %s non envoyé, nouvel essai au prochain démarrage", reminder["id"])
         if not self.tasks.interrupted:
             return
         lines = [f"#{t.id} ({t.agent}, {t.cwd.name}) : {t.prompt[:60]}" for t in self.tasks.interrupted]
@@ -373,6 +522,12 @@ class Jarvis:
             (["log"], self.cmd_log),
             (["stop"], self.cmd_stop),
             (["relancer", "retry"], self.cmd_retry),
+            (["rappel"], self.cmd_reminder),
+            (["rappels"], self.cmd_reminders),
+            (["effacer_rappel"], self.cmd_delete_reminder),
+            (["note"], self.cmd_note),
+            (["memoire"], self.cmd_memory),
+            (["oublie"], self.cmd_forget),
             (["get"], self.cmd_get),
             (["reset"], self.cmd_reset),
             (["briefing"], self.cmd_briefing),
@@ -382,6 +537,7 @@ class Jarvis:
             app.add_handler(CommandHandler(name, auth(self.agent_command(name))))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auth(self.on_text)))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, auth(self.on_voice)))
+        app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, auth(self.on_file)))
 
         if self.cfg.briefing_time:
             hour, minute = (int(x) for x in self.cfg.briefing_time.split(":"))
@@ -389,6 +545,23 @@ class Jarvis:
                 self.daily_briefing, time=dtime(hour, minute, tzinfo=ZoneInfo(self.cfg.timezone))
             )
         return app
+
+
+def _fmt_when(when: datetime) -> str:
+    return f"{WEEKDAYS[when.weekday()]} {when:%d/%m} à {when:%H:%M}"
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r"[^\w.\- ]", "_", Path(name).name).strip(" .")
+    return name[:100] or "fichier"
+
+
+def _unique_path(path: Path) -> Path:
+    candidate, n = path, 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        n += 1
+    return candidate
 
 
 def _ensure_git(cwd: Path) -> None:
