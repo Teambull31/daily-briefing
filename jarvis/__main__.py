@@ -14,7 +14,10 @@ def main() -> None:
     cfg = Config.from_env()
     if not cfg.allowed_user_ids:
         logging.warning("ALLOWED_USER_IDS vide : mode configuration, seul /id répond.")
-    logging.info("Jarvis démarré — modèle %s, agent : %s", cfg.chat_model, cfg.agent_cmd)
+    logging.info(
+        "Jarvis démarré — modèle %s, agents : %s (défaut : %s)",
+        cfg.chat_model, ", ".join(cfg.agents), cfg.default_agent,
+    )
     Jarvis(cfg).build_app().run_polling()
 
 

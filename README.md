@@ -10,7 +10,7 @@ Telegram est gratuit, la météo (Open-Meteo) et les actus (RSS) aussi.
 ```
  Téléphone (Telegram) ──► Bot Jarvis (sur ton PC) ──► Ollama (LLM local, GPU)
          ▲                     │
-         │                     └──► Agent de code (OpenCode / Aider / Claude Code)
+         │                     └──► Agent au choix : OpenCode+Ollama (gratuit) ou Claude Code (abonnement)
          └──── notification ◄──────── travaille dans ~/jarvis-workspace/<projet>
 ```
 
@@ -26,6 +26,7 @@ Pas besoin d'ouvrir de port sur ta box : le bot va chercher les messages chez Te
 | `/briefing` (ou automatiquement chaque matin) | Météo + résumé des actus |
 | `/projet site-perso` puis des demandes | Travaille dans ce dossier, garde l'historique git |
 | `/taches`, `/log 3`, `/stop 3`, `/get index.html` | Suivre, arrêter, récupérer un fichier |
+| `/claude <tâche>` ou « Claude, … » | Utilise Claude Code (ton abonnement) au lieu du modèle gratuit |
 
 Jarvis choisit seul entre « répondre » et « agir » (`AUTO_ROUTE=1`). Tu peux forcer avec `/ask` ou `/do`.
 Les tâches n'ont **aucune limite de durée**.
@@ -93,19 +94,43 @@ L'agent **exécute des commandes sur ton PC**. Donc :
 - Chaque projet est un dépôt git : tu vois quels fichiers ont changé, et tu peux annuler.
 - Ne mets jamais le token Telegram dans git (`.env` est ignoré).
 
-## Gratuit vs Claude : sois réaliste
+## Alterner entre modèles gratuits et Claude Code (abonnement)
 
-Les modèles locaux sont bons pour des scripts, petits sites, automatisations, explications.
-Pour de gros projets ou du code complexe, ils se trompent plus souvent — laisser tourner longtemps
-aide, mais ne remplace pas un modèle plus fort. Deux options si tu as un abonnement Claude :
+Déclare plusieurs agents dans `.env` (voir `.env.example`) :
 
-- **Garder Jarvis, changer d'agent** : dans `.env`,
-  `AGENT_CMD=claude -p {prompt} --dangerously-skip-permissions` (installe Claude Code sur le PC).
-  Même interface Telegram, mais c'est Claude qui code (consomme ton abonnement).
-- **Claude Code Remote Control** : lance `claude remote-control` dans un terminal sur ton PC,
-  dans le dossier voulu. La session apparaît dans l'app Claude sur ton téléphone et tourne sur ton PC.
+```ini
+AGENT_LOCAL=opencode run -m ollama/qwen3-coder:30b {prompt}
+AGENT_CLAUDE=claude -p {prompt} --dangerously-skip-permissions
+DEFAULT_AGENT=local
+```
 
-Tu peux mixer : Ollama pour discuter et le briefing (gratuit), Claude seulement pour les grosses tâches.
+Puis depuis ton téléphone :
+
+| Tu envoies | Effet |
+|---|---|
+| `/claude refais le design du site` | Cette tâche seulement avec Claude Code |
+| `Claude, corrige le bug du login` (texte ou vocal) | Pareil |
+| `/claude` (seul) ou `/agent claude` | Claude devient l'agent par défaut |
+| `/local` ou `/agent local` | Retour aux modèles gratuits |
+| `/agent` | Liste des agents et celui qui est actif |
+
+**Abonnement, pas API** : installe Claude Code sur le PC et connecte-toi une fois avec `claude login`
+(compte Pro/Max). Jarvis retire `ANTHROPIC_API_KEY` et `ANTHROPIC_AUTH_TOKEN` de l'environnement de
+Claude Code : même si une clé API traîne sur ta machine, elle ne sera pas utilisée. Les limites d'usage
+de ton abonnement s'appliquent. Si une tâche Claude échoue (limite atteinte par exemple), Jarvis te
+propose de la relancer avec l'agent gratuit. Sous Windows, préfère l'installateur natif de Claude Code
+(`claude.exe`) à la version npm.
+
+Les questions simples (sans `/claude`) et le briefing restent sur Ollama : ils ne consomment rien.
+Un projet garde son dossier et son historique git quel que soit l'agent : tu peux commencer avec
+le modèle gratuit et demander à Claude de reprendre.
+
+**Pourquoi alterner ?** Les modèles locaux sont bons pour des scripts, petits sites, automatisations
+et explications. Sur les gros projets ou le code complexe, ils se trompent plus souvent. Claude est
+bien plus fiable, mais consomme ton quota. Tu gardes donc Claude pour ce qui le mérite.
+
+Alternative sans Jarvis : `claude remote-control` dans un terminal sur ton PC. La session apparaît
+dans l'app Claude sur ton téléphone et tourne sur ton PC.
 
 ## Et le VPS ?
 

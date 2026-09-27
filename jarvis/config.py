@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,13 +30,39 @@ def _ids(raw: str) -> frozenset[int]:
     return frozenset(int(x) for x in raw.replace(";", ",").split(",") if x.strip())
 
 
+AGENT_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+# Noms déjà pris par les commandes du bot : un agent ne peut pas s'appeler comme elles.
+RESERVED_NAMES = frozenset(
+    "start aide help ask do projet project taches tasks log stop get reset briefing id agent agents cmd".split()
+)
+
+
+def parse_agents(env: dict[str, str]) -> dict[str, str]:
+    """Lit les agents déclarés en AGENT_<NOM>=commande (ex: AGENT_CLAUDE=claude -p {prompt}).
+
+    Compatibilité : un simple AGENT_CMD devient l'agent "local".
+    """
+    agents = {}
+    for key, value in env.items():
+        if not key.startswith("AGENT_") or key == "AGENT_CMD" or not value.strip():
+            continue
+        name = key[len("AGENT_"):].lower()
+        if not AGENT_NAME_RE.match(name) or name in RESERVED_NAMES:
+            raise SystemExit(f"Nom d'agent invalide ou réservé : {key}")
+        agents[name] = value.strip()
+    if not agents:
+        agents["local"] = env.get("AGENT_CMD", DEFAULT_AGENT_CMD)
+    return agents
+
+
 @dataclass(frozen=True)
 class Config:
     telegram_token: str
     allowed_user_ids: frozenset[int]
     ollama_url: str = "http://localhost:11434"
     chat_model: str = "qwen3:14b"
-    agent_cmd: str = DEFAULT_AGENT_CMD
+    agents: dict[str, str] = field(default_factory=lambda: {"local": DEFAULT_AGENT_CMD})
+    default_agent: str = "local"
     workspace: Path = Path.home() / "jarvis-workspace"
     max_parallel_tasks: int = 1
     auto_route: bool = True
@@ -53,13 +80,18 @@ class Config:
         token = env.get("TELEGRAM_TOKEN", "").strip()
         if not token:
             raise SystemExit("TELEGRAM_TOKEN manquant (voir .env.example).")
-        # Vide = mode configuration : le bot ne répond qu'à /id (voir bot.py).
+        agents = parse_agents(dict(env))
+        default_agent = env.get("DEFAULT_AGENT", "").strip().lower() or next(iter(agents))
+        if default_agent not in agents:
+            raise SystemExit(f"DEFAULT_AGENT={default_agent} ne correspond à aucun AGENT_<NOM>.")
+        # ALLOWED_USER_IDS vide = mode configuration : le bot ne répond qu'à /id (voir bot.py).
         return cls(
             telegram_token=token,
             allowed_user_ids=_ids(env.get("ALLOWED_USER_IDS", "")),
             ollama_url=env.get("OLLAMA_URL", cls.ollama_url).rstrip("/"),
             chat_model=env.get("CHAT_MODEL", cls.chat_model),
-            agent_cmd=env.get("AGENT_CMD", DEFAULT_AGENT_CMD),
+            agents=agents,
+            default_agent=default_agent,
             workspace=Path(env.get("WORKSPACE", str(cls.workspace))).expanduser(),
             max_parallel_tasks=max(1, int(env.get("MAX_PARALLEL_TASKS", "1"))),
             auto_route=env.get("AUTO_ROUTE", "1") not in ("0", "false", "no"),

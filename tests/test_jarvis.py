@@ -3,11 +3,13 @@ import sys
 import time
 from pathlib import Path
 
-from jarvis.bot import resolve_inside, split_message
+import pytest
+
+from jarvis.bot import Jarvis, resolve_inside, split_message
 from jarvis.briefing import parse_feed
-from jarvis.config import Config, load_dotenv
+from jarvis.config import Config, load_dotenv, parse_agents
 from jarvis.llm import strip_thinking
-from jarvis.tasks import TaskManager, build_argv
+from jarvis.tasks import TaskManager, agent_env, build_argv
 
 PY = sys.executable.replace("\\", "/")
 
@@ -107,6 +109,49 @@ def test_split_message():
 
 def test_strip_thinking():
     assert strip_thinking("<think>hmm\n</think>\nRéponse") == "Réponse"
+
+
+def test_parse_agents():
+    agents = parse_agents({"AGENT_LOCAL": "opencode run {prompt}", "AGENT_CLAUDE": "claude -p {prompt}", "X": "y"})
+    assert agents == {"local": "opencode run {prompt}", "claude": "claude -p {prompt}"}
+    assert parse_agents({"AGENT_CMD": "aider --message"}) == {"local": "aider --message"}
+    with pytest.raises(SystemExit):
+        parse_agents({"AGENT_LOG": "x"})  # /log est déjà une commande
+
+
+def test_claude_agent_never_gets_api_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    assert "ANTHROPIC_API_KEY" not in agent_env(["/usr/bin/claude", "-p", "x"])
+    assert "ANTHROPIC_API_KEY" not in agent_env([r"C:\npm\claude.cmd", "-p", "x"])
+    assert agent_env(["/usr/bin/opencode", "run"])["ANTHROPIC_API_KEY"] == "sk-ant-test"
+
+
+def test_task_uses_requested_agent(tmp_path: Path):
+    async def scenario():
+        tm = TaskManager(
+            {"local": f'{PY} -c "print(\'LOCAL\')"', "claude": f'{PY} -c "print(\'CLAUDE\')"'}, logs_dir=tmp_path
+        )
+        a = tm.submit("x", tmp_path)
+        b = tm.submit("x", tmp_path, agent="claude")
+        await asyncio.gather(*tm._runners)
+        return a, b
+
+    a, b = asyncio.run(scenario())
+    assert (a.agent, b.agent) == ("local", "claude")
+    assert "LOCAL" in a.tail() and "CLAUDE" in b.tail()
+
+
+def test_agent_prefix_detection(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "x")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("AGENT_LOCAL", "opencode run {prompt}")
+    monkeypatch.setenv("AGENT_CLAUDE", "claude -p {prompt}")
+    jarvis = Jarvis(Config.from_env())
+    m = jarvis._agent_prefix.match("Claude, crée un site vitrine")
+    assert (m.group(2).lower(), m.group(3)) == ("claude", "crée un site vitrine")
+    m = jarvis._agent_prefix.match("@local fais un script")
+    assert (m.group(1), m.group(3)) == ("local", "fais un script")
+    assert jarvis._agent_prefix.match("claude est-il meilleur que qwen ?") is None
 
 
 def test_config_from_env(tmp_path: Path, monkeypatch):

@@ -35,6 +35,9 @@ HELP = """🤖 Jarvis — tes commandes
 Écris simplement ce que tu veux : je décide seul s'il faut répondre ou agir sur ton PC.
 
 /do <tâche> — force une action (coder, créer, lancer…)
+/agent [nom] — voir / changer l'agent qui exécute les tâches
+/<agent> <tâche> — une tâche avec cet agent (ex : /claude …)
+@<agent> <tâche> ou « Claude, … » — pareil, en texte ou à la voix
 /ask <question> — force une simple réponse
 /projet [nom] — change de projet (dossier de travail)
 /taches — liste des tâches
@@ -70,7 +73,10 @@ class Jarvis:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.llm = Ollama(cfg.ollama_url, cfg.chat_model)
-        self.tasks = TaskManager(cfg.agent_cmd, cfg.max_parallel_tasks, cfg.workspace / ".jarvis-logs")
+        self.tasks = TaskManager(cfg.agents, cfg.max_parallel_tasks, cfg.workspace / ".jarvis-logs")
+        names = "|".join(re.escape(n) for n in cfg.agents)
+        # "@claude fais ça", "claude: fais ça", "Claude, fais ça" (utile à la voix)
+        self._agent_prefix = re.compile(rf"^\s*(?:@({names})\b[\s,:]*|({names})\s*[,:]\s*)(.+)$", re.I | re.S)
         cfg.workspace.mkdir(parents=True, exist_ok=True)
 
     # ---------- utilitaires ----------
@@ -89,6 +95,10 @@ class Jarvis:
 
         return wrapper
 
+    def current_agent(self, context: ContextTypes.DEFAULT_TYPE) -> str:
+        agent = context.chat_data.get("agent")
+        return agent if agent in self.cfg.agents else self.cfg.default_agent
+
     def project_dir(self, context: ContextTypes.DEFAULT_TYPE) -> Path:
         return self.cfg.workspace / context.chat_data.get("project", DEFAULT_PROJECT)
 
@@ -100,6 +110,11 @@ class Jarvis:
     # ---------- logique principale ----------
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        match = self._agent_prefix.match(text)
+        if match:  # agent désigné explicitement : c'est forcément une tâche
+            agent = (match.group(1) or match.group(2)).lower()
+            await self.start_task(update, context, match.group(3).strip(), agent)
+            return
         if self.cfg.auto_route:
             await update.effective_chat.send_action(ChatAction.TYPING)
             if await self.llm.route(text) == "task":
@@ -119,7 +134,10 @@ class Jarvis:
         del history[: -2 * HISTORY_TURNS]
         await self.reply(update, reply)
 
-    async def start_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+    async def start_task(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, agent: str | None = None
+    ) -> None:
+        agent = agent or self.current_agent(context)
         cwd = self.project_dir(context)
         _ensure_git(cwd)
         chat_id = update.effective_chat.id
@@ -128,17 +146,21 @@ class Jarvis:
             icon = {"terminée": "✅", "échouée": "❌", "annulée": "🛑"}.get(task.status, "ℹ️")
             changes = _git_changes(task.cwd)
             text = (
-                f"{icon} Tâche #{task.id} {task.status} en {task.duration} (projet {task.cwd.name})\n"
+                f"{icon} Tâche #{task.id} {task.status} en {task.duration} "
+                f"(agent {task.agent}, projet {task.cwd.name})\n"
                 + (f"\nFichiers modifiés :\n{changes}\n" if changes else "")
                 + f"\n— fin du journal —\n{task.tail(2500)}"
             )
+            others = [a for a in self.cfg.agents if a != task.agent]
+            if task.status == "échouée" and others:
+                text += f"\n\n💡 Réessayer avec un autre agent : /{others[0]} <tâche>"
             for chunk in split_message(text):
                 await context.bot.send_message(chat_id, chunk)
 
-        task = self.tasks.submit(prompt, cwd, on_done)
+        task = self.tasks.submit(prompt, cwd, on_done, agent)
         await self.reply(
             update,
-            f"🛠 Tâche #{task.id} lancée dans « {cwd.name} ».\n"
+            f"🛠 Tâche #{task.id} lancée avec « {agent} » dans « {cwd.name} ».\n"
             f"Je te préviens quand c'est fini (aucune limite de temps). /log {task.id} pour suivre.",
         )
 
@@ -162,6 +184,32 @@ class Jarvis:
             return
         await self.start_task(update, context, " ".join(context.args))
 
+    async def cmd_agent(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        current = self.current_agent(context)
+        if not context.args:
+            lines = [f"{'👉' if n == current else '  '} {n} : {cmd}" for n, cmd in self.cfg.agents.items()]
+            await self.reply(update, "🤖 Agents :\n" + "\n".join(lines) + "\n\n/agent <nom> pour changer.")
+            return
+        await self._switch_agent(update, context, context.args[0].lower())
+
+    async def _switch_agent(self, update: Update, context: ContextTypes.DEFAULT_TYPE, name: str) -> None:
+        if name not in self.cfg.agents:
+            await self.reply(update, f"Agent inconnu. Disponibles : {', '.join(self.cfg.agents)}")
+            return
+        context.chat_data["agent"] = name
+        await self.reply(update, f"🤖 Les prochaines tâches utiliseront « {name} ».")
+
+    def agent_command(self, name: str):
+        """/claude <tâche> lance une tâche avec Claude ; /claude seul en fait l'agent par défaut."""
+
+        async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if context.args:
+                await self.start_task(update, context, " ".join(context.args), name)
+            else:
+                await self._switch_agent(update, context, name)
+
+        return handler
+
     async def cmd_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
             existing = sorted(p.name for p in self.cfg.workspace.iterdir() if p.is_dir() and not p.name.startswith("."))
@@ -184,7 +232,7 @@ class Jarvis:
         if not tasks:
             await self.reply(update, "Aucune tâche pour l'instant.")
             return
-        lines = [f"#{t.id} [{t.status}, {t.duration}] {t.cwd.name} : {t.prompt[:60]}" for t in tasks]
+        lines = [f"#{t.id} [{t.status}, {t.duration}] {t.agent}@{t.cwd.name} : {t.prompt[:60]}" for t in tasks]
         await self.reply(update, "\n".join(lines))
 
     def _task_from_args(self, context: ContextTypes.DEFAULT_TYPE) -> Task | None:
@@ -260,6 +308,7 @@ class Jarvis:
             (["start", "aide", "help"], self.cmd_help),
             (["ask"], self.cmd_ask),
             (["do"], self.cmd_do),
+            (["agent", "agents"], self.cmd_agent),
             (["projet", "project"], self.cmd_project),
             (["taches", "tasks"], self.cmd_tasks),
             (["log"], self.cmd_log),
@@ -269,6 +318,8 @@ class Jarvis:
             (["briefing"], self.cmd_briefing),
         ]:
             app.add_handler(CommandHandler(names, auth(fn)))
+        for name in self.cfg.agents:
+            app.add_handler(CommandHandler(name, auth(self.agent_command(name))))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auth(self.on_text)))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, auth(self.on_voice)))
 

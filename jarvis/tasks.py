@@ -1,6 +1,7 @@
 """File de tâches longues exécutées par un agent de code (OpenCode, Aider, Claude Code...).
 
-Chaque tâche lance la commande AGENT_CMD dans un dossier projet, sans limite de durée,
+Chaque tâche lance la commande de l'agent choisi (AGENT_<NOM>) dans un dossier projet,
+sans limite de durée,
 et écrit toute la sortie dans un fichier journal consultable depuis le téléphone.
 """
 
@@ -9,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -21,9 +23,22 @@ from typing import Awaitable, Callable
 
 PROMPT_TOKEN = "{prompt}"
 
+# Si l'une de ces variables existe, Claude Code facture à l'API au lieu d'utiliser
+# l'abonnement (compte connecté via `claude login`) : on les retire pour lui.
+API_BILLING_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def agent_env(argv: list[str]) -> dict[str, str]:
+    env = dict(os.environ)
+    exe = re.split(r"[\\/]", argv[0])[-1].lower()  # marche pour les chemins Windows et Unix
+    if exe.rsplit(".", 1)[0] == "claude":
+        for var in API_BILLING_VARS:
+            env.pop(var, None)
+    return env
+
 
 def build_argv(template: str, prompt: str) -> list[str]:
-    """Transforme le modèle AGENT_CMD en liste d'arguments.
+    """Transforme la commande d'un agent en liste d'arguments.
 
     Le prompt est passé comme un argument unique (jamais interprété par un shell).
     """
@@ -44,6 +59,7 @@ class Task:
     prompt: str
     cwd: Path
     log_path: Path
+    agent: str = ""
     status: str = "en attente"  # en attente | en cours | terminée | échouée | annulée
     returncode: int | None = None
     started: float | None = None
@@ -71,20 +87,23 @@ Notifier = Callable[[Task], Awaitable[None]]
 
 
 class TaskManager:
-    def __init__(self, agent_cmd: str, max_parallel: int = 1, logs_dir: Path | None = None):
-        self.agent_cmd = agent_cmd
+    def __init__(self, agents: dict[str, str] | str, max_parallel: int = 1, logs_dir: Path | None = None):
+        self.agents = {"local": agents} if isinstance(agents, str) else dict(agents)
         self.logs_dir = logs_dir
         self.tasks: dict[int, Task] = {}
         self._ids = itertools.count(1)
         self._sem = asyncio.Semaphore(max_parallel)
         self._runners: set[asyncio.Task] = set()
 
-    def submit(self, prompt: str, cwd: Path, on_done: Notifier | None = None) -> Task:
+    def submit(self, prompt: str, cwd: Path, on_done: Notifier | None = None, agent: str | None = None) -> Task:
+        agent = agent or next(iter(self.agents))
+        if agent not in self.agents:
+            raise KeyError(agent)
         cwd.mkdir(parents=True, exist_ok=True)
         logs_dir = self.logs_dir or cwd / ".jarvis-logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         task_id = next(self._ids)
-        task = Task(task_id, prompt, cwd, logs_dir / f"tache-{task_id}.log")
+        task = Task(task_id, prompt, cwd, logs_dir / f"tache-{task_id}.log", agent)
         self.tasks[task_id] = task
         runner = asyncio.create_task(self._run(task, on_done))
         self._runners.add(runner)
@@ -98,7 +117,7 @@ class TaskManager:
             task.status = "en cours"
             task.started = time.time()
             try:
-                argv = build_argv(self.agent_cmd, task.prompt)
+                argv = build_argv(self.agents[task.agent], task.prompt)
                 with task.log_path.open("wb") as log:
                     log.write(f"$ {' '.join(argv[:-1])} <prompt>\n# {task.prompt}\n\n".encode())
                     log.flush()
@@ -108,6 +127,7 @@ class TaskManager:
                         stdin=asyncio.subprocess.DEVNULL,
                         stdout=log,
                         stderr=asyncio.subprocess.STDOUT,
+                        env=agent_env(argv),
                         **_new_process_group(),
                     )
                     task.returncode = await task.proc.wait()
