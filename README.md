@@ -31,7 +31,42 @@ Pas besoin d'ouvrir de port sur ta box : le bot va chercher les messages chez Te
 Jarvis choisit seul entre « répondre » et « agir » (`AUTO_ROUTE=1`). Tu peux forcer avec `/ask` ou `/do`.
 Les tâches n'ont **aucune limite de durée**.
 
-## Installation (sur ton PC, ~20 min)
+## Installation express : Fedora + GPU AMD (ta config)
+
+Pensé pour : **Fedora 44, Radeon RX 7900 GRE (16 Go VRAM), 32 Go de RAM, Ryzen 5 3600X.**
+
+```bash
+git clone https://github.com/Teambull31/daily-briefing && cd daily-briefing
+git checkout claude/mobile-jarvis-assistant-klqx0n   # tant que ce n'est pas fusionné
+./deploy/install-fedora.sh
+```
+
+Le script installe et configure tout : Ollama avec ROCm (l'accélération AMD), les modèles, Python,
+OpenCode, le vocal, le bot Telegram (il récupère ton identifiant tout seul), Claude Code en option,
+le démarrage automatique et la désactivation de la veille. Il te pose 3-4 questions, rien d'autre.
+Compte ~30 Go de téléchargement pour les modèles.
+
+**Modèles choisis pour ta machine**
+
+| Rôle | Modèle | Où il tourne |
+|---|---|---|
+| Discussion + tri des demandes | `qwen3:14b` (~9 Go) | Entièrement sur la 7900 GRE : réponses rapides |
+| Agent de code | `qwen3-coder:30b` (~19 Go) | La majeure partie sur la carte, le reste en RAM. C'est un modèle « MoE » (seule une petite partie travaille à chaque mot), donc ça reste fluide malgré le débordement |
+| Variante agent rapide | `gpt-oss:20b` (~13 Go) | Entièrement sur la carte : plus rapide, un peu moins fort en code (`AGENT_RAPIDE` dans `.env`) |
+| Vocal | Whisper `small` | Processeur (faster-whisper ne gère pas les cartes AMD) : quelques secondes par message |
+
+Quand une tâche de code tourne, les deux modèles ne tiennent pas ensemble dans les 16 Go : Ollama
+alterne, ce qui ajoute quelques secondes à la première réponse suivante. Si ça te gêne,
+mets `CHAT_MODEL=qwen3:8b` dans `.env`.
+
+**Dépannage GPU** (si `ollama ps` affiche « CPU » au lieu de « GPU ») :
+- `journalctl -u ollama -n 50` : cherche les lignes « amdgpu » / « rocm ».
+- Vérifie que l'utilisateur `ollama` est dans les groupes `render` et `video` : `id ollama`.
+- En dernier recours, les versions récentes d'Ollama ont un moteur Vulkan : ajoute
+  `Environment="OLLAMA_VULKAN=1"` dans `/etc/systemd/system/ollama.service.d/jarvis.conf`,
+  puis `sudo systemctl daemon-reload && sudo systemctl restart ollama`.
+
+## Installation manuelle (autres systèmes, ~20 min)
 
 ### 1. Ollama + modèles
 
@@ -81,7 +116,7 @@ cp .env.example .env                # Windows : copy .env.example .env
 
 ### 4. Démarrage automatique
 
-- **Linux / WSL** : `deploy/jarvis.service` (instructions dans le fichier).
+- **Linux / WSL** : `deploy/jarvis.service` (instructions dans le fichier). Logs : `journalctl --user -u jarvis -f`.
 - **Windows** : `deploy/start-jarvis.ps1` + Planificateur de tâches (instructions dans le fichier).
 - Pense à désactiver la mise en veille du PC, ou active le Wake-on-LAN.
 

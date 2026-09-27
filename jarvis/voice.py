@@ -17,10 +17,14 @@ def available() -> bool:
 
 @lru_cache(maxsize=1)
 def _model(name: str):
+    import ctranslate2
     from faster_whisper import WhisperModel
 
-    # "auto" utilise le GPU s'il est disponible, sinon le CPU.
-    return WhisperModel(name, device="auto", compute_type="default")
+    # GPU NVIDIA si présent ; sinon (cartes AMD comprises, non gérées par CTranslate2)
+    # CPU en int8, rapide et léger en mémoire.
+    if ctranslate2.get_cuda_device_count() > 0:
+        return WhisperModel(name, device="cuda", compute_type="float16")
+    return WhisperModel(name, device="cpu", compute_type="int8")
 
 
 def _transcribe(path: Path, model_name: str) -> str:
