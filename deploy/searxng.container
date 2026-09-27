@@ -1,0 +1,25 @@
+# SearXNG (recherche web privée et gratuite pour Jarvis), lancé par Podman via systemd (Quadlet).
+# Installé automatiquement par deploy/install-fedora.sh. Installation manuelle :
+#   mkdir -p ~/.config/containers/systemd ~/.config/searxng ~/.local/share/searxng
+#   cp deploy/searxng.container ~/.config/containers/systemd/
+#   cp deploy/searxng-settings.yml ~/.config/searxng/settings.yml   # puis changer secret_key
+#   systemctl --user daemon-reload && systemctl --user start searxng
+# Accessible uniquement depuis le PC : http://localhost:8888
+[Unit]
+Description=SearXNG - recherche web pour Jarvis
+
+[Container]
+Image=docker.io/searxng/searxng:latest
+ContainerName=searxng
+PublishPort=127.0.0.1:8888:8080
+Volume=%h/.config/searxng:/etc/searxng:Z
+Volume=%h/.local/share/searxng:/var/cache/searxng:Z
+Environment=SEARXNG_BASE_URL=http://localhost:8888/
+# Écoute en IPv4 dans le conteneur (sinon plantage si l'IPv6 est désactivé sur la machine)
+Environment=GRANIAN_HOST=0.0.0.0
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

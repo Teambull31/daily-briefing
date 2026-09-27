@@ -27,6 +27,7 @@ from .llm import WEEKDAYS, Ollama
 from .memory import REMEMBER_PREFIX, REMINDER_PREFIX, Store, parse_reminder
 from .status import ollama_lines, system_lines
 from .tasks import ACTIVE, Task, TaskManager, supports_resume
+from .web import web_answer
 
 log = logging.getLogger("jarvis")
 
@@ -45,6 +46,7 @@ HELP = """🤖 Jarvis — tes commandes
 /<agent> <tâche> — une tâche avec cet agent (ex : /claude …)
 @<agent> <tâche> ou « Claude, … » — pareil, en texte ou à la voix
 /ask <question> — force une simple réponse
+/web <question> — cherche sur internet et répond avec les sources
 /projet [nom] — change de projet (dossier de travail)
 /taches — liste des tâches
 /log <n> — dernières lignes d'une tâche
@@ -161,7 +163,18 @@ class Jarvis:
             if action == "remember":
                 await self.remember(update, text)
                 return
+            if action == "web" and self.cfg.searxng_url:
+                await self.web(update, text)
+                return
         await self.answer(update, context, text)
+
+    async def web(self, update: Update, question: str) -> None:
+        if not self.cfg.searxng_url:
+            await self.reply(update, "🔎 Recherche web désactivée : installe SearXNG, puis SEARXNG_URL (README).")
+            return
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        await self.reply(update, "🔎 Je cherche…")
+        await self.reply(update, await web_answer(self.llm, self.cfg.searxng_url, question))
 
     # ---------- mémoire et rappels ----------
 
@@ -283,6 +296,12 @@ class Jarvis:
             await self.reply(update, "Usage : /ask <question>")
             return
         await self.answer(update, context, " ".join(context.args))
+
+    async def cmd_web(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await self.reply(update, "Usage : /web <question>")
+            return
+        await self.web(update, " ".join(context.args))
 
     async def cmd_do(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
@@ -554,6 +573,7 @@ class Jarvis:
         for names, fn in [
             (["start", "aide", "help"], self.cmd_help),
             (["ask"], self.cmd_ask),
+            (["web"], self.cmd_web),
             (["do"], self.cmd_do),
             (["suite", "continue"], self.cmd_continue),
             (["etat", "status"], self.cmd_status),

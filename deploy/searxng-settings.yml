@@ -1,0 +1,11 @@
+# Configuration minimale de SearXNG pour Jarvis.
+use_default_settings: true
+
+server:
+  secret_key: "CHANGE-MOI"   # remplacé par une valeur aléatoire par install-fedora.sh
+  limiter: false             # instance privée, accessible seulement depuis le PC
+
+search:
+  formats:
+    - html
+    - json                   # indispensable : Jarvis interroge l'API JSON

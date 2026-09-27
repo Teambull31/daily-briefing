@@ -35,7 +35,7 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 step "Paquets système"
-sudo dnf install -y git python3 python3-pip curl zstd pciutils
+sudo dnf install -y git python3 python3-pip curl zstd pciutils podman
 
 step "Ollama (IA locale, accélérée par ta Radeon via ROCm)"
 if command -v ollama >/dev/null; then
@@ -120,6 +120,28 @@ print(msgs[-1]["from"]["id"] if msgs else "")')" || user_id=""
         info "✅ Ton identifiant ($user_id) est autorisé."
     else
         info "⚠️  Aucun message reçu. Plus tard : envoie /id au bot et mets le nombre dans ALLOWED_USER_IDS (.env)."
+    fi
+fi
+
+step "Recherche web (SearXNG, gratuit et privé)"
+if ask_yes "Installer SearXNG pour que Jarvis puisse chercher sur internet (/web) ?"; then
+    mkdir -p "$HOME/.config/containers/systemd" "$HOME/.config/searxng" "$HOME/.local/share/searxng"
+    if [[ ! -f "$HOME/.config/searxng/settings.yml" ]]; then
+        secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+        sed "s/CHANGE-MOI/$secret/" deploy/searxng-settings.yml > "$HOME/.config/searxng/settings.yml"
+    fi
+    cp deploy/searxng.container "$HOME/.config/containers/systemd/searxng.container"
+    systemctl --user daemon-reload
+    systemctl --user restart searxng
+    for _ in $(seq 1 60); do  # premier démarrage : téléchargement de l'image
+        curl -fsS "http://localhost:8888/search?q=test&format=json" >/dev/null 2>&1 && break
+        sleep 2
+    done
+    set_env SEARXNG_URL "http://localhost:8888"
+    if curl -fsS "http://localhost:8888/search?q=test&format=json" >/dev/null 2>&1; then
+        info "✅ SearXNG répond sur http://localhost:8888"
+    else
+        info "⚠️  SearXNG ne répond pas encore : systemctl --user status searxng"
     fi
 fi
 

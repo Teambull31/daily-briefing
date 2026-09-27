@@ -27,6 +27,7 @@ Pas besoin d'ouvrir de port sur ta box : le bot va chercher les messages chez Te
 | `/projet site-perso` puis des demandes | Travaille dans ce dossier, garde l'historique git |
 | `/taches`, `/log 3`, `/stop 3`, `/relancer 3`, `/get index.html` | Suivre, arrêter, relancer, récupérer un fichier |
 | `/suite ajoute aussi un mode sombre` | Continue la dernière tâche du projet **dans la même session** de l'agent (il se souvient de ce qu'il vient de faire) |
+| `/web prix d'une RTX 5070` ou « quels sont les résultats du match d'hier ? » | Cherche sur internet (SearXNG), lit les pages et répond en citant ses sources |
 | `/etat` | Charge GPU, VRAM, température, RAM, disque, modèles chargés dans Ollama (et % sur GPU), tâches en cours |
 | `/claude <tâche>` ou « Claude, … » | Utilise Claude Code (ton abonnement) au lieu du modèle gratuit |
 | « Rappelle-moi demain à 9h d'appeler le garage » | Rappel programmé (`/rappels` pour la liste) |
@@ -56,7 +57,7 @@ git checkout claude/mobile-jarvis-assistant-klqx0n   # tant que ce n'est pas fus
 ```
 
 Le script installe et configure tout : Ollama avec ROCm (l'accélération AMD), les modèles, Python,
-OpenCode, le vocal, le bot Telegram (il récupère ton identifiant tout seul), Claude Code en option,
+OpenCode, le vocal, la recherche web (SearXNG dans Podman, en option), le bot Telegram (il récupère ton identifiant tout seul), Claude Code en option,
 le démarrage automatique et la désactivation de la veille. Il te pose 3-4 questions, rien d'autre.
 Compte ~30 Go de téléchargement pour les modèles.
 

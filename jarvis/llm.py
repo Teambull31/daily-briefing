@@ -19,12 +19,14 @@ ROUTER_PROMPT = """Classe la demande suivante.
 - "reminder" : l'utilisateur veut qu'on lui rappelle quelque chose à un moment donné.
 - "remember" : l'utilisateur donne une information sur lui à retenir durablement
   (préférence, fait personnel, contexte de ses projets).
+- "web" : une question qui demande des informations récentes ou précises à chercher sur internet
+  (actualité, prix, horaires, résultats sportifs, sortie d'un produit, météo ailleurs, documentation).
 - "chat" : une simple question, une explication, une conversation, un conseil.
 Réponds UNIQUEMENT en JSON, par exemple {"action": "chat"}.
 
 Demande : """
 
-ACTIONS = ("task", "reminder", "remember", "chat")
+ACTIONS = ("task", "reminder", "remember", "web", "chat")
 
 WHEN_PROMPT = """Nous sommes le {now} ({weekday}). Extrais le rappel demandé ci-dessous.
 Réponds UNIQUEMENT en JSON : {{"datetime": "AAAA-MM-JJTHH:MM", "texte": "ce qu'il faut rappeler"}}.

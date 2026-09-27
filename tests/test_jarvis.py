@@ -456,3 +456,77 @@ def test_ollama_status(monkeypatch):
 
     monkeypatch.setattr(status.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(lambda r: httpx.Response(500, text="x")), **kw))
     assert asyncio.run(status.ollama_lines("http://x")) == ["❌ Ollama ne répond pas"]
+
+
+# ---------- recherche web ----------
+
+
+def test_html_to_text_skips_scripts_and_menus():
+    from jarvis.web import html_to_text
+
+    html = """<html><head><style>p{}</style><script>var x=1</script></head><body>
+    <nav>Menu Accueil</nav><h1>Titre</h1><p>Le  texte &eacute;tudi&eacute;.</p><footer>©</footer></body></html>"""
+    assert html_to_text(html) == "Titre Le texte étudié."
+
+
+def test_web_answer_cites_sources():
+    import httpx
+
+    from jarvis.llm import Ollama
+    from jarvis.web import web_answer
+
+    prompts = []
+
+    def handler(req):
+        if req.url.host == "searx":
+            assert req.url.params["format"] == "json"
+            return httpx.Response(200, json={"results": [
+                {"title": "Page A", "url": "https://a.test/x", "content": "extrait A"},
+                {"title": "Page B", "url": "https://b.test/y", "content": "extrait B"},
+                {"title": "Page C", "url": "https://c.test/z", "content": "extrait C"},
+                {"title": "sans url"},
+            ]})
+        if req.url.host == "a.test":
+            return httpx.Response(200, html="<p>Contenu complet de A. " + "Détails utiles. " * 20 + "</p>")
+        if req.url.host == "c.test":
+            return httpx.Response(200, html="<p>Making sure you're not a bot! " + "Loading... " * 30 + "</p>")
+        if req.url.host == "b.test":
+            return httpx.Response(404)
+        prompts.append(json.loads(req.content)["messages"][0]["content"])
+        return httpx.Response(200, json={"message": {"content": "Réponse [1]"}})
+
+    real = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+
+    async def scenario(monkeypatch_client):
+        import jarvis.web as web
+
+        web.httpx.AsyncClient = monkeypatch_client
+        try:
+            o = Ollama("http://ollama", "m")
+            o._client = real(transport=transport)
+            return await web_answer(o, "http://searx", "question ?")
+        finally:
+            web.httpx.AsyncClient = real
+
+    out = asyncio.run(scenario(lambda **kw: real(transport=transport, **kw)))
+    assert out.startswith("Réponse [1]")
+    assert "[1] https://a.test/x" in out and "[2] https://b.test/y" in out
+    assert "Contenu complet de A" in prompts[0] and "extrait A" in prompts[0]
+    assert "extrait B" in prompts[0]  # page 404 : on garde l'extrait du moteur
+    assert "extrait C" in prompts[0] and "not a bot" not in prompts[0]  # page anti-robot ignorée
+
+
+def test_web_answer_when_searxng_is_down():
+    import httpx
+
+    import jarvis.web as web
+    from jarvis.llm import Ollama
+
+    real = httpx.AsyncClient
+    web.httpx.AsyncClient = lambda **kw: real(transport=httpx.MockTransport(lambda r: httpx.Response(503)), **kw)
+    try:
+        out = asyncio.run(web.web_answer(Ollama("http://o", "m"), "http://searx", "q"))
+    finally:
+        web.httpx.AsyncClient = real
+    assert "SearXNG est-il lancé" in out
