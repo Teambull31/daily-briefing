@@ -34,7 +34,7 @@ AGENT_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 # Noms déjà pris par les commandes du bot : un agent ne peut pas s'appeler comme elles.
 RESERVED_NAMES = frozenset(
     "start aide help ask do projet project taches tasks log stop get reset briefing id agent agents cmd "
-    "relancer retry rappel rappels effacer_rappel note memoire oublie".split()
+    "relancer retry rappel rappels effacer_rappel note memoire oublie suite continue etat status".split()
 )
 
 

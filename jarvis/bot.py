@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import shutil
@@ -24,7 +25,8 @@ from .briefing import build_briefing
 from .config import Config
 from .llm import WEEKDAYS, Ollama
 from .memory import REMEMBER_PREFIX, REMINDER_PREFIX, Store, parse_reminder
-from .tasks import ACTIVE, Task, TaskManager
+from .status import ollama_lines, system_lines
+from .tasks import ACTIVE, Task, TaskManager, supports_resume
 
 log = logging.getLogger("jarvis")
 
@@ -38,6 +40,7 @@ HELP = """🤖 Jarvis — tes commandes
 Écris simplement ce que tu veux : je décide seul s'il faut répondre ou agir sur ton PC.
 
 /do <tâche> — force une action (coder, créer, lancer…)
+/suite <message> — continue la dernière tâche du projet, dans la même session de l'agent
 /agent [nom] — voir / changer l'agent qui exécute les tâches
 /<agent> <tâche> — une tâche avec cet agent (ex : /claude …)
 @<agent> <tâche> ou « Claude, … » — pareil, en texte ou à la voix
@@ -49,6 +52,7 @@ HELP = """🤖 Jarvis — tes commandes
 /relancer <n> — relance une tâche (échouée, interrompue…)
 /get <fichier> — t'envoie un fichier du projet
 /briefing — météo + actus du jour
+/etat — GPU, mémoire, IA chargée, tâches en cours
 /rappel <quand + quoi> — ex : /rappel demain à 9h appeler le garage
 /rappels — rappels prévus (/effacer_rappel <n>)
 /note <info> — je retiens une info sur toi (/memoire, /oublie <n>)
@@ -213,6 +217,7 @@ class Jarvis:
         prompt: str,
         agent: str | None = None,
         cwd: Path | None = None,
+        resume: bool = False,
     ) -> None:
         agent = agent or self.current_agent(context)
         cwd = cwd or self.project_dir(context)
@@ -234,12 +239,16 @@ class Jarvis:
             others = [a for a in self.cfg.agents if a != task.agent]
             if task.status == "échouée" and others:
                 text += f"\n\n💡 Réessayer avec un autre agent : /{others[0]} <tâche>"
+            elif task.status == "terminée" and supports_resume(self.cfg.agents.get(task.agent, "")):
+                text += "\n\n↪️ /suite <message> pour continuer dans la même session"
             for chunk in split_message(text):
                 await context.bot.send_message(chat_id, chunk)
 
-        task = self.tasks.submit(prompt, cwd, on_done, agent)
+        task = self.tasks.submit(prompt, cwd, on_done, agent, resume)
         status_msg = await update.effective_message.reply_text(
-            f"🛠 Tâche #{task.id} lancée avec « {agent} » dans « {cwd.name} ».\n"
+            f"🛠 Tâche #{task.id} lancée avec « {agent} » dans « {cwd.name} »"
+            + (" (suite de la session)" if resume else "")
+            + ".\n"
             f"Je te préviens quand c'est fini (aucune limite de temps). /log {task.id} pour suivre."
         )
         if self.cfg.progress_minutes and context.job_queue and task.status in ACTIVE:
@@ -306,6 +315,36 @@ class Jarvis:
                 await self._switch_agent(update, context, name)
 
         return handler
+
+    async def cmd_continue(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await self.reply(update, "Usage : /suite <ce qu'il faut faire ensuite>")
+            return
+        prompt, cwd = " ".join(context.args), self.project_dir(context)
+        last = self.tasks.last_in(cwd)
+        if not last:
+            await self.reply(update, "Aucune tâche précédente dans ce projet : je démarre une nouvelle session.")
+            await self.start_task(update, context, prompt)
+            return
+        agent = last.agent if last.agent in self.cfg.agents else self.current_agent(context)
+        resume = supports_resume(self.cfg.agents[agent])
+        if not resume:
+            await self.reply(update, f"L'agent « {agent} » ne sait pas reprendre une session : nouvelle session.")
+        await self.start_task(update, context, prompt, agent, cwd, resume)
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        machine = await asyncio.to_thread(system_lines, self.cfg.workspace)
+        lines = ["🖥 Machine", *machine, "", "🧠 IA locale", *await ollama_lines(self.cfg.ollama_url)]
+        running = self.tasks.running()
+        lines += ["", f"🛠 Tâches actives : {len(running)}"]
+        lines += [f"  • #{t.id} {t.status} ({t.agent}, {t.cwd.name}, {t.duration})" for t in running]
+        lines += [
+            "",
+            f"🤖 Agent : {self.current_agent(context)} · 📁 Projet : {self.project_dir(context).name}",
+            f"⏰ Rappels prévus : {len(self.store.reminders)} · 🧠 Notes : {len(self.store.notes)}",
+        ]
+        await self.reply(update, "\n".join(lines))
 
     async def cmd_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
@@ -516,6 +555,8 @@ class Jarvis:
             (["start", "aide", "help"], self.cmd_help),
             (["ask"], self.cmd_ask),
             (["do"], self.cmd_do),
+            (["suite", "continue"], self.cmd_continue),
+            (["etat", "status"], self.cmd_status),
             (["agent", "agents"], self.cmd_agent),
             (["projet", "project"], self.cmd_project),
             (["taches", "tasks"], self.cmd_tasks),

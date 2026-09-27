@@ -384,3 +384,75 @@ def test_reminder_flow_end_to_end(monkeypatch, tmp_path: Path):
     asyncio.run(callback(context))
     assert sent == [(42, "⏰ Rappel : sortir le chien")]
     assert jarvis.store.reminders == []
+
+
+# ---------- /suite et /etat ----------
+
+
+@pytest.mark.parametrize(
+    "template, expected",
+    [
+        ("claude -p {prompt} --dangerously-skip-permissions", ["-p", "--continue", "go", "--dangerously-skip-permissions"]),
+        ("opencode run -m ollama/x {prompt}", ["run", "-m", "ollama/x", "--continue", "go"]),
+        ("aider --yes-always --message", ["--yes-always", "--message", "--restore-chat-history", "go"]),
+        ("inconnu --x {prompt}", ["--x", "go"]),
+    ],
+)
+def test_build_argv_resume(template, expected):
+    assert build_argv(template, "go", resume=True)[1:] == expected
+    assert "--continue" not in build_argv(template, "go")
+
+
+def test_supports_resume_and_last_in(tmp_path: Path):
+    from jarvis.tasks import supports_resume
+
+    assert supports_resume("claude -p {prompt}") and supports_resume("/home/u/.opencode/bin/opencode run")
+    assert not supports_resume("goose run -t {prompt}")
+
+    async def scenario():
+        tm = TaskManager(f'{PY} -c "print(1)"', logs_dir=tmp_path / "logs")
+        tm.submit("a", tmp_path / "p1")
+        b = tm.submit("b", tmp_path / "p2", resume=True)
+        c = tm.submit("c", tmp_path / "p1")
+        await asyncio.gather(*tm._runners)
+        return tm, b, c
+
+    tm, b, c = asyncio.run(scenario())
+    assert tm.last_in(tmp_path / "p1") is c and tm.last_in(tmp_path / "p2") is b
+    assert TaskManager("echo", logs_dir=tmp_path / "logs").tasks[b.id].resume is True
+
+
+def test_amd_gpu_and_memory_from_sysfs(tmp_path: Path):
+    from jarvis.status import amd_gpus, memory
+
+    dev = tmp_path / "card1" / "device"
+    (dev / "hwmon" / "hwmon3").mkdir(parents=True)
+    (dev / "mem_info_vram_total").write_text(str(16 * 1024**3))
+    (dev / "mem_info_vram_used").write_text(str(9 * 1024**3))
+    (dev / "gpu_busy_percent").write_text("87\n")
+    (dev / "hwmon" / "hwmon3" / "temp1_input").write_text("64000")
+    (tmp_path / "card0" / "device").mkdir(parents=True)  # carte non AMD : ignorée
+    assert amd_gpus(tmp_path) == ["GPU 87% · VRAM 9.0/16 Go · 64°C"]
+
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:       32768000 kB\nMemAvailable:   16384000 kB\n")
+    assert memory(meminfo) == "RAM 15.6/31 Go"
+
+
+def test_ollama_status(monkeypatch):
+    import httpx
+
+    import jarvis.status as status
+
+    def handler(req):
+        if req.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.12.3"})
+        return httpx.Response(200, json={"models": [{"name": "qwen3:14b", "size": 10 * 1024**3, "size_vram": 10 * 1024**3}]})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(status.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    lines = asyncio.run(status.ollama_lines("http://x"))
+    assert lines == ["✅ Ollama 0.12.3", "  • qwen3:14b chargé (10.0 Go, 100% sur GPU)"]
+
+    monkeypatch.setattr(status.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(lambda r: httpx.Response(500, text="x")), **kw))
+    assert asyncio.run(status.ollama_lines("http://x")) == ["❌ Ollama ne répond pas"]

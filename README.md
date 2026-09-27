@@ -26,6 +26,8 @@ Pas besoin d'ouvrir de port sur ta box : le bot va chercher les messages chez Te
 | `/briefing` (ou automatiquement chaque matin) | Météo + résumé des actus |
 | `/projet site-perso` puis des demandes | Travaille dans ce dossier, garde l'historique git |
 | `/taches`, `/log 3`, `/stop 3`, `/relancer 3`, `/get index.html` | Suivre, arrêter, relancer, récupérer un fichier |
+| `/suite ajoute aussi un mode sombre` | Continue la dernière tâche du projet **dans la même session** de l'agent (il se souvient de ce qu'il vient de faire) |
+| `/etat` | Charge GPU, VRAM, température, RAM, disque, modèles chargés dans Ollama (et % sur GPU), tâches en cours |
 | `/claude <tâche>` ou « Claude, … » | Utilise Claude Code (ton abonnement) au lieu du modèle gratuit |
 | « Rappelle-moi demain à 9h d'appeler le garage » | Rappel programmé (`/rappels` pour la liste) |
 | « Souviens-toi que je code surtout en Python » | Retenu durablement, utilisé dans les réponses (`/memoire`) |

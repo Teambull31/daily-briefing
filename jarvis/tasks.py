@@ -26,6 +26,12 @@ from typing import Awaitable, Callable
 PROMPT_TOKEN = "{prompt}"
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 ACTIVE = ("en attente", "en cours")
+# Options pour reprendre la dernière session de l'agent dans le même dossier (/suite).
+RESUME_FLAGS = {
+    "claude": ["--continue"],
+    "opencode": ["--continue"],
+    "aider": ["--restore-chat-history"],
+}
 log = logging.getLogger("jarvis.tasks")
 
 # Si l'une de ces variables existe, Claude Code facture à l'API au lieu d'utiliser
@@ -33,26 +39,37 @@ log = logging.getLogger("jarvis.tasks")
 API_BILLING_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 
+def exe_name(path: str) -> str:
+    """« /usr/bin/claude » ou « C:\\npm\\claude.cmd » -> « claude » (quel que soit le système)."""
+    return re.split(r"[\\/]", path)[-1].lower().rsplit(".", 1)[0]
+
+
+def supports_resume(template: str) -> bool:
+    argv = shlex.split(template, posix=True)
+    return bool(argv) and exe_name(argv[0]) in RESUME_FLAGS
+
+
 def agent_env(argv: list[str]) -> dict[str, str]:
     env = dict(os.environ)
     env["NO_COLOR"] = "1"  # sorties lisibles sur Telegram (pas de codes couleur)
-    exe = re.split(r"[\\/]", argv[0])[-1].lower()  # marche pour les chemins Windows et Unix
-    if exe.rsplit(".", 1)[0] == "claude":
+    if exe_name(argv[0]) == "claude":
         for var in API_BILLING_VARS:
             env.pop(var, None)
     return env
 
 
-def build_argv(template: str, prompt: str) -> list[str]:
+def build_argv(template: str, prompt: str, resume: bool = False) -> list[str]:
     """Transforme la commande d'un agent en liste d'arguments.
 
     Le prompt est passé comme un argument unique (jamais interprété par un shell).
+    Avec resume=True, les options de reprise de session sont ajoutées juste avant le prompt.
     """
     argv = shlex.split(template, posix=True)
-    if PROMPT_TOKEN in argv:
-        argv = [prompt if a == PROMPT_TOKEN else a for a in argv]
-    else:
-        argv.append(prompt)
+    if PROMPT_TOKEN not in argv:
+        argv.append(PROMPT_TOKEN)
+    pos = argv.index(PROMPT_TOKEN)
+    extra = RESUME_FLAGS.get(exe_name(argv[0]), []) if resume else []
+    argv = argv[:pos] + extra + [prompt] + [a for a in argv[pos + 1:] if a != PROMPT_TOKEN]
     resolved = shutil.which(argv[0])  # indispensable sous Windows (.cmd/.exe)
     if resolved:
         argv[0] = resolved
@@ -66,6 +83,7 @@ class Task:
     cwd: Path
     log_path: Path
     agent: str = ""
+    resume: bool = False
     status: str = "en attente"  # en attente | en cours | terminée | échouée | annulée | interrompue
     returncode: int | None = None
     started: float | None = None
@@ -96,13 +114,14 @@ class Task:
     def to_dict(self) -> dict:
         return {
             "id": self.id, "prompt": self.prompt, "cwd": str(self.cwd), "log_path": str(self.log_path),
-            "agent": self.agent, "status": self.status, "returncode": self.returncode,
+            "agent": self.agent, "resume": self.resume, "status": self.status, "returncode": self.returncode,
             "started": self.started, "finished": self.finished,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Task":
         task = cls(d["id"], d["prompt"], Path(d["cwd"]), Path(d["log_path"]), d.get("agent", ""))
+        task.resume = d.get("resume", False)
         task.status, task.returncode = d.get("status", "terminée"), d.get("returncode")
         task.started, task.finished = d.get("started"), d.get("finished")
         return task
@@ -124,7 +143,14 @@ class TaskManager:
         self._sem = asyncio.Semaphore(max_parallel)
         self._runners: set[asyncio.Task] = set()
 
-    def submit(self, prompt: str, cwd: Path, on_done: Notifier | None = None, agent: str | None = None) -> Task:
+    def submit(
+        self,
+        prompt: str,
+        cwd: Path,
+        on_done: Notifier | None = None,
+        agent: str | None = None,
+        resume: bool = False,
+    ) -> Task:
         agent = agent or next(iter(self.agents))
         if agent not in self.agents:
             raise KeyError(agent)
@@ -132,7 +158,7 @@ class TaskManager:
         logs_dir = self.logs_dir or cwd / ".jarvis-logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         task_id = next(self._ids)
-        task = Task(task_id, prompt, cwd, logs_dir / f"tache-{task_id}.log", agent)
+        task = Task(task_id, prompt, cwd, logs_dir / f"tache-{task_id}.log", agent, resume)
         self.tasks[task_id] = task
         self._save()
         runner = asyncio.create_task(self._run(task, on_done))
@@ -148,7 +174,7 @@ class TaskManager:
             task.started = time.time()
             self._save()
             try:
-                argv = build_argv(self.agents[task.agent], task.prompt)
+                argv = build_argv(self.agents[task.agent], task.prompt, task.resume)
                 with task.log_path.open("wb") as log:
                     log.write(f"$ {' '.join(argv[:-1])} <prompt>\n# {task.prompt}\n\n".encode())
                     log.flush()
@@ -190,6 +216,10 @@ class TaskManager:
 
     def recent(self, n: int = 10) -> list[Task]:
         return sorted(self.tasks.values(), key=lambda t: t.id, reverse=True)[:n]
+
+    def last_in(self, cwd: Path) -> Task | None:
+        """Dernière tâche lancée dans ce dossier projet."""
+        return next((t for t in self.recent(len(self.tasks)) if t.cwd == cwd), None)
 
     def running(self) -> list[Task]:
         return [t for t in self.tasks.values() if t.status in ACTIVE]
