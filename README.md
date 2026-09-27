@@ -1,1 +1,121 @@
-"# daily-briefing" 
+# Jarvis — ton assistant perso, piloté depuis ton téléphone
+
+Tu écris (ou dictes) une demande sur Telegram depuis ton téléphone → ton **PC** la reçoit →
+Jarvis répond, ou lance un **agent de code** qui travaille sur ton PC aussi longtemps
+qu'il faut → tu reçois une notification avec le résultat.
+
+**100 % gratuit** en mode local : l'IA tourne sur ta carte graphique via [Ollama](https://ollama.com),
+Telegram est gratuit, la météo (Open-Meteo) et les actus (RSS) aussi.
+
+```
+ Téléphone (Telegram) ──► Bot Jarvis (sur ton PC) ──► Ollama (LLM local, GPU)
+         ▲                     │
+         │                     └──► Agent de code (OpenCode / Aider / Claude Code)
+         └──── notification ◄──────── travaille dans ~/jarvis-workspace/<projet>
+```
+
+Pas besoin d'ouvrir de port sur ta box : le bot va chercher les messages chez Telegram.
+
+## Ce que ça fait
+
+| Tu envoies | Jarvis fait |
+|---|---|
+| « C'est quoi la différence entre TCP et UDP ? » | Répond directement (LLM local) |
+| « Crée-moi un script qui renomme mes photos par date » | Lance une tâche, code, teste, te prévient à la fin |
+| 🎙 un message vocal | Le transcrit en local puis le traite pareil |
+| `/briefing` (ou automatiquement chaque matin) | Météo + résumé des actus |
+| `/projet site-perso` puis des demandes | Travaille dans ce dossier, garde l'historique git |
+| `/taches`, `/log 3`, `/stop 3`, `/get index.html` | Suivre, arrêter, récupérer un fichier |
+
+Jarvis choisit seul entre « répondre » et « agir » (`AUTO_ROUTE=1`). Tu peux forcer avec `/ask` ou `/do`.
+Les tâches n'ont **aucune limite de durée**.
+
+## Installation (sur ton PC, ~20 min)
+
+### 1. Ollama + modèles
+
+Installe [Ollama](https://ollama.com/download) (Windows, Linux, macOS), puis choisis selon ta carte graphique :
+
+| VRAM | Discussion (`CHAT_MODEL`) | Agent de code |
+|---|---|---|
+| 8 Go | `qwen3:8b` | `qwen2.5-coder:7b` |
+| 12–16 Go | `qwen3:14b` | `qwen2.5-coder:14b` |
+| 24 Go et + | `qwen3:32b` | `qwen3-coder:30b` |
+
+```bash
+ollama pull qwen3:14b
+ollama pull qwen3-coder:30b
+```
+
+> Les modèles évoluent vite : regarde les plus récents sur ollama.com/search.
+> `qwen3-coder:30b` fonctionne aussi avec moins de VRAM (une partie passe en RAM), juste plus lentement.
+> Pour les agents, augmente le contexte : variable d'environnement `OLLAMA_CONTEXT_LENGTH=32768`.
+
+### 2. L'agent de code (gratuit) : OpenCode
+
+```bash
+npm install -g opencode-ai        # nécessite Node.js
+```
+
+Copie `opencode.example.json` vers `~/.config/opencode/opencode.json`
+(Windows : `%USERPROFILE%\.config\opencode\opencode.json`) et adapte les noms de modèles.
+Test : `opencode run -m ollama/qwen3-coder:30b "écris hello.py qui affiche bonjour"`.
+
+### 3. Le bot Telegram
+
+1. Sur Telegram, parle à **@BotFather** → `/newbot` → récupère le token.
+2. Installe Jarvis :
+
+```bash
+git clone <ce dépôt> daily-briefing && cd daily-briefing
+python -m venv .venv
+# Linux/WSL : source .venv/bin/activate     Windows : .venv\Scripts\activate
+pip install -r requirements.txt
+pip install faster-whisper          # optionnel : messages vocaux
+cp .env.example .env                # Windows : copy .env.example .env
+```
+
+3. Mets le token dans `.env`, lance `python -m jarvis`, envoie `/id` à ton bot,
+   copie ton identifiant dans `ALLOWED_USER_IDS`, relance. C'est prêt.
+
+### 4. Démarrage automatique
+
+- **Linux / WSL** : `deploy/jarvis.service` (instructions dans le fichier).
+- **Windows** : `deploy/start-jarvis.ps1` + Planificateur de tâches (instructions dans le fichier).
+- Pense à désactiver la mise en veille du PC, ou active le Wake-on-LAN.
+
+## Sécurité — à lire
+
+L'agent **exécute des commandes sur ton PC**. Donc :
+
+- `ALLOWED_USER_IDS` est obligatoire : sans lui, personne ne peut rien faire (seul `/id` répond).
+- Idéalement, lance Jarvis dans **WSL**, une VM ou un compte utilisateur dédié, pas sur ta session principale.
+- Chaque projet est un dépôt git : tu vois quels fichiers ont changé, et tu peux annuler.
+- Ne mets jamais le token Telegram dans git (`.env` est ignoré).
+
+## Gratuit vs Claude : sois réaliste
+
+Les modèles locaux sont bons pour des scripts, petits sites, automatisations, explications.
+Pour de gros projets ou du code complexe, ils se trompent plus souvent — laisser tourner longtemps
+aide, mais ne remplace pas un modèle plus fort. Deux options si tu as un abonnement Claude :
+
+- **Garder Jarvis, changer d'agent** : dans `.env`,
+  `AGENT_CMD=claude -p {prompt} --dangerously-skip-permissions` (installe Claude Code sur le PC).
+  Même interface Telegram, mais c'est Claude qui code (consomme ton abonnement).
+- **Claude Code Remote Control** : lance `claude remote-control` dans un terminal sur ton PC,
+  dans le dossier voulu. La session apparaît dans l'app Claude sur ton téléphone et tourne sur ton PC.
+
+Tu peux mixer : Ollama pour discuter et le briefing (gratuit), Claude seulement pour les grosses tâches.
+
+## Et le VPS ?
+
+Ton PC est plus puissant, donc c'est lui qui fait le travail. Le VPS peut servir de solution de secours
+toujours allumée : même installation avec un petit modèle (`qwen3:4b`) pour le briefing et les
+questions simples quand le PC est éteint — avec un **autre** bot Telegram (un token ne peut être
+utilisé que par une seule instance à la fois).
+
+## Tests
+
+```bash
+pip install pytest && python -m pytest -q
+```

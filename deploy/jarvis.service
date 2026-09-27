@@ -1,0 +1,17 @@
+# Service systemd (Linux / WSL) : démarre Jarvis au boot et le relance s'il plante.
+# Installation :
+#   cp deploy/jarvis.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now jarvis
+#   loginctl enable-linger $USER   # pour qu'il tourne même sans session ouverte
+[Unit]
+Description=Jarvis - assistant pilotable depuis le téléphone
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/daily-briefing
+ExecStart=%h/daily-briefing/.venv/bin/python -m jarvis
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
