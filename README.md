@@ -164,6 +164,24 @@ L'agent **exécute des commandes sur ton PC**. Donc :
   le bilan du soir (`REVIEW_TIME=20:30`) te demande par quoi commencer demain.
 - La session de focus survit à un redémarrage du PC ; une session arrêtée compte quand même le temps passé.
 
+### Habitudes, relances, statistiques, agenda
+
+| Tu envoies | Jarvis fait |
+|---|---|
+| `/habitude sport`, puis « j'ai fait du sport » ou `/check sport` | Suit l'habitude, compte la série 🔥 et fête les paliers (7, 14, 30, 100 jours) |
+| `/habitudes` | Ce qui est fait ou pas aujourd'hui, avec les séries |
+| (rien : c'est automatique) | **Relance** si ta tâche prioritaire n'a pas bougé depuis `NUDGE_HOURS` pendant tes heures de travail — jamais pendant un focus ni en plein rendez-vous |
+| `/plustard` | Repousse la tâche du moment en fin de liste et remet les relances à zéro |
+| `/stats` · `/stats 30` | **Graphique** : minutes de concentration, tâches cochées et habitudes tenues par jour, + résumé chiffré. Envoyé aussi chaque dimanche avec le bilan |
+| `/agenda` · `/agenda demain` | Tes rendez-vous (et dans le briefing du matin) |
+| (automatique) | Rappel vocal `EVENT_REMINDER_MINUTES` avant chaque rendez-vous |
+| `/bloquer` · `/bloquer 90` | Trouve le prochain créneau libre dans tes heures de travail, t'envoie un fichier `.ics` à toucher pour l'ajouter à ton agenda, et te rappelle de lancer `/focus` à l'heure |
+
+**Connecter Google Agenda** (2 minutes, lecture seule, sans compte développeur) : sur ordinateur, Google Agenda →
+⚙️ Paramètres → clique sur ton agenda → « Intégrer l'agenda » → **Adresse secrète au format iCal** → copie-la dans
+`CALENDAR_ICS_URLS` du `.env`. Marche aussi avec Proton, Nextcloud, Outlook, iCloud (toute adresse `.ics`).
+Jarvis ne peut pas écrire dans ton agenda par ce biais : c'est pour ça que `/bloquer` t'envoie un fichier `.ics` à ajouter d'un geste.
+
 ## Alterner entre modèles gratuits et Claude Code (abonnement)
 
 Déclare plusieurs agents dans `.env` (voir `.env.example`) :

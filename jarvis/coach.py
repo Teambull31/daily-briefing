@@ -40,7 +40,8 @@ def fmt_minutes(minutes: int) -> str:
 
 
 class CoachMixin:
-    """Nécessite : self.cfg, self.store, self.llm, self.tasks, self.speaker, self.now(), self.reply()."""
+    """Nécessite : self.cfg, self.store, self.llm, self.tasks, self.speaker, self.now(), self.reply(),
+    et de LifeMixin : self.mark_progress(), self.habit_summary_lines(), self.send_stats()."""
 
     # ---------- voix ----------
 
@@ -105,6 +106,7 @@ class CoachMixin:
         for item in items:
             urgent = item.startswith("!")
             self.store.add_todo(item.lstrip("! "), urgent=urgent, now=self.now())
+        self.mark_progress()
         count = len(self.store.pending_todos)
         added = items[0].lstrip("! ") if len(items) == 1 else f"{len(items)} tâches"
         hint = "/todos pour la liste, /next pour démarrer."
@@ -135,6 +137,7 @@ class CoachMixin:
             await self.reply(update, "Rien à cocher (voir /todos).")
             return
         self.store.complete_todo(todo, self.now())
+        self.mark_progress()
         done_today = len(self.store.done_on(self.now().date()))
         following = self.store.pending_todos
         text = f"✅ Bravo ! « {todo['text']} » est fait. ({done_today} aujourd'hui)"
@@ -201,6 +204,7 @@ class CoachMixin:
         }
         self.store.set_focus(session)
         self._schedule_focus(context.job_queue, session)
+        self.mark_progress()
         cycles = f" ({rounds} sessions)" if rounds > 1 else ""
         about = f" sur « {topic} »" if topic else ""
         await self.reply(
@@ -297,14 +301,15 @@ class CoachMixin:
         lines.append(f"🎯 Concentration : {n_sessions} session(s), {fmt_minutes(minutes)}")
         if agent_tasks:
             lines.append(f"🛠 Tâches réalisées par l'agent : {len(agent_tasks)}")
+        lines += self.habit_summary_lines(day)
         pending = self.todo_lines(limit=3)
         if pending:
             lines.append("📝 Reste en tête de liste :")
             lines += [f"   {line}" for line in pending]
         return "\n".join(lines)
 
-    def agenda(self) -> str:
-        """Pour le briefing du matin : la liste du jour et les rappels d'aujourd'hui."""
+    def todo_agenda(self) -> str:
+        """Partie « liste du jour, rappels du jour, concentration d'hier » du briefing du matin."""
         today = self.now().date()
         parts = []
         todos = self.todo_lines(limit=5)
@@ -333,5 +338,7 @@ class CoachMixin:
         for user_id in self.cfg.allowed_user_ids:
             try:
                 await self.notify(context.bot, user_id, text)
+                if now.isoweekday() == 7:  # dimanche : bilan de la semaine en graphique
+                    await self.send_stats(context.bot, user_id, 7)
             except TelegramError:
                 log.warning("Bilan non envoyé à %s", user_id)

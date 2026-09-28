@@ -22,7 +22,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from . import voice
 from .briefing import build_briefing
+from .calendar_ics import CalendarSource
 from .coach import FOCUS_PREFIX, TODO_PREFIX, CoachMixin, extract_todo
+from .life import LifeMixin
 from .config import Config
 from .llm import WEEKDAYS, Ollama
 from .memory import REMEMBER_PREFIX, REMINDER_PREFIX, Store, parse_reminder
@@ -71,6 +73,13 @@ HELP = """🤖 Jarvis — tes commandes
 /focus [min] [xN] [sujet] — session de concentration (pomodoro)
 /stopfocus — arrête la session · /bilan — ta journée
 /voix off|rappels|tout — rappels et réponses en messages vocaux
+/plustard — repousse la tâche du moment en fin de liste
+
+🔁 Habitudes & suivi
+/habitude <nom> — suivre une habitude · /habitudes — séries 🔥
+/check <n|nom> — cochée aujourd'hui (ou dis « j'ai fait du sport »)
+/stats [30] — graphique de ta semaine (ou 30 jours)
+/agenda [demain] — tes rendez-vous · /bloquer [min] — réserve un créneau de focus
 
 🎙 Les messages vocaux marchent aussi (si faster-whisper est installé).
 📎 Envoie un fichier ou une photo : il est rangé dans le projet actif (dossier inbox/).
@@ -98,7 +107,7 @@ def resolve_inside(base: Path, rel: str) -> Path | None:
     return target if target.is_relative_to(base.resolve()) else None
 
 
-class Jarvis(CoachMixin):
+class Jarvis(CoachMixin, LifeMixin):
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.llm = Ollama(cfg.ollama_url, cfg.chat_model, think=cfg.chat_think)
@@ -110,6 +119,7 @@ class Jarvis(CoachMixin):
         self.store = Store(cfg.workspace / ".jarvis-memoire.json")
         self.tz = ZoneInfo(cfg.timezone)
         self.speaker = Speaker(cfg.tts_voice, cfg.workspace / ".voix") if Speaker.available() else None
+        self.calendar = CalendarSource(cfg.calendar_urls, self.tz)
 
     # ---------- utilitaires ----------
 
@@ -163,6 +173,9 @@ class Jarvis(CoachMixin):
             return
         if REMEMBER_PREFIX.match(text):
             await self.remember(update, REMEMBER_PREFIX.sub("", text, count=1))
+            return
+        if habit := self.match_habit_claim(text):
+            await self.check_habit(update, habit)
             return
         if TODO_PREFIX.match(text):
             await self.add_todos(update, text)
@@ -537,7 +550,7 @@ class Jarvis(CoachMixin):
 
     async def cmd_briefing(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_chat.send_action(ChatAction.TYPING)
-        text = await build_briefing(self.cfg, self.llm, self.agenda())
+        text = await build_briefing(self.cfg, self.llm, await self.agenda())
         await self.reply(update, text)
         if self.voice_mode != "off":
             await self.send_voice(context.bot, update.effective_chat.id, text)
@@ -608,7 +621,7 @@ class Jarvis(CoachMixin):
                     pass
 
     async def daily_briefing(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        text = await build_briefing(self.cfg, self.llm, self.agenda())
+        text = await build_briefing(self.cfg, self.llm, await self.agenda())
         for user_id in self.cfg.allowed_user_ids:
             try:
                 await self.notify(context.bot, user_id, text[:4000])
@@ -662,6 +675,14 @@ class Jarvis(CoachMixin):
             (["stopfocus"], self.cmd_stop_focus),
             (["bilan"], self.cmd_review),
             (["voix"], self.cmd_voice),
+            (["plustard"], self.cmd_postpone),
+            (["habitude"], self.cmd_habit),
+            (["habitudes"], self.cmd_habits),
+            (["check"], self.cmd_check),
+            (["suppr_habitude"], self.cmd_remove_habit),
+            (["stats"], self.cmd_stats),
+            (["agenda"], self.cmd_agenda),
+            (["bloquer"], self.cmd_block),
         ]:
             app.add_handler(CommandHandler(names, auth(fn)))
         for name in self.cfg.agents:
@@ -676,6 +697,10 @@ class Jarvis(CoachMixin):
             app.job_queue.run_daily(
                 self.daily_briefing, time=dtime(hour, minute, tzinfo=ZoneInfo(self.cfg.timezone))
             )
+        if self.cfg.nudge_hours:
+            app.job_queue.run_repeating(self.nudge_check, interval=15 * 60, first=60)
+        if self.calendar.enabled:
+            app.job_queue.run_repeating(self.event_reminder_check, interval=5 * 60, first=30)
         if self.cfg.review_time:
             hour, minute = (int(x) for x in self.cfg.review_time.split(":"))
             app.job_queue.run_daily(self.evening_review, time=dtime(hour, minute, tzinfo=self.tz))

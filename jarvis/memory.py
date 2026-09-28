@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -14,7 +14,7 @@ class Store:
         self.path = path
         self.data: dict = {
             "notes": [], "reminders": [], "next_id": 1,
-            "todos": [], "focus": None, "focus_log": [], "settings": {},
+            "todos": [], "focus": None, "focus_log": [], "settings": {}, "habits": [],
         }
         if path.is_file():
             try:
@@ -125,6 +125,53 @@ class Store:
         """(nombre de sessions, minutes de concentration) pour un jour donné."""
         sessions = [f for f in self.data["focus_log"] if datetime.fromisoformat(f["start"]).date() == day]
         return len(sessions), sum(f["minutes"] for f in sessions)
+
+    # ---------- habitudes ----------
+
+    @property
+    def habits(self) -> list[dict]:
+        return self.data["habits"]
+
+    def add_habit(self, name: str, today: date) -> dict:
+        habit = {"id": self.data["next_id"], "name": name.strip(), "created": today.isoformat(), "log": []}
+        self.data["next_id"] += 1
+        self.habits.append(habit)
+        self.save()
+        return habit
+
+    def remove_habit(self, habit: dict) -> None:
+        self.habits.remove(habit)
+        self.save()
+
+    def check_habit(self, habit: dict, day: date) -> bool:
+        """Coche l'habitude pour ce jour. False si c'était déjà fait."""
+        if day.isoformat() in habit["log"]:
+            return False
+        habit["log"] = sorted(set(habit["log"]) | {day.isoformat()})[-400:]
+        self.save()
+        return True
+
+    @staticmethod
+    def habit_done_on(habit: dict, day: date) -> bool:
+        return day.isoformat() in habit["log"]
+
+    @staticmethod
+    def streak(habit: dict, today: date) -> int:
+        """Jours consécutifs jusqu'à aujourd'hui (ou hier, si pas encore fait aujourd'hui)."""
+        done = set(habit["log"])
+        day = today if today.isoformat() in done else today - timedelta(days=1)
+        count = 0
+        while day.isoformat() in done:
+            count += 1
+            day -= timedelta(days=1)
+        return count
+
+    def habits_rate_on(self, day: date) -> float | None:
+        """Part des habitudes (existant ce jour-là) cochées ; None s'il n'y en avait aucune."""
+        existing = [h for h in self.habits if date.fromisoformat(h["created"]) <= day]
+        if not existing:
+            return None
+        return sum(self.habit_done_on(h, day) for h in existing) / len(existing)
 
     # ---------- réglages ----------
 

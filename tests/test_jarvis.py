@@ -857,7 +857,7 @@ def test_todo_commands_and_next(monkeypatch, tmp_path: Path):
     assert "1. rédiger le devis" in replies[-1] and "Faites aujourd'hui : 2" in replies[-1]
     summary = jarvis.daily_summary(jarvis.now().date())
     assert "Tâches cochées : 2" in summary and "rédiger le devis" in summary
-    assert "📝 À faire aujourd'hui" in jarvis.agenda()
+    assert "📝 À faire aujourd'hui" in asyncio.run(jarvis.agenda())
 
 
 def test_breakdown_adds_steps(monkeypatch, tmp_path: Path):
@@ -892,3 +892,202 @@ def test_clean_for_speech():
     assert clean_for_speech("⏰ ⏱️ Rappel : **sortir** 🎉 https://x.y /rappels") == "Rappel : sortir"
     long_text = "Phrase courte. " * 100
     assert len(clean_for_speech(long_text)) <= 600 and clean_for_speech(long_text).endswith(".")
+
+
+# ---------- habitudes, relances, statistiques, agenda ----------
+
+MONDAY_10H = datetime(2026, 9, 28, 10, 0, tzinfo=ZoneInfo("Europe/Paris"))
+
+SAMPLE_ICS = """BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:standup
+DTSTART:20260928T080000Z
+DTEND:20260928T090000Z
+SUMMARY:Réunion équipe
+LOCATION:Bureau
+RRULE:FREQ=DAILY;COUNT=5
+END:VEVENT
+BEGIN:VEVENT
+UID:dentiste
+DTSTART;TZID=Europe/Paris:20260928T110000
+DTEND;TZID=Europe/Paris:20260928T123000
+SUMMARY:Dentiste
+END:VEVENT
+BEGIN:VEVENT
+UID:anniv
+DTSTART;VALUE=DATE:20260928
+DTEND;VALUE=DATE:20260929
+SUMMARY:Anniversaire de Léa
+END:VEVENT
+END:VCALENDAR
+"""
+
+
+class FakeBotWithFiles(FakeBot):
+    def __init__(self):
+        super().__init__()
+        self.photos = []
+
+    async def send_photo(self, chat_id, photo, caption=None, **kw):
+        self.photos.append((chat_id, photo, caption))
+
+
+def _life(monkeypatch, tmp_path, now=MONDAY_10H, **env):
+    jarvis = _coach(monkeypatch, tmp_path, **env)
+    monkeypatch.setattr(jarvis, "now", lambda: now)
+    return jarvis
+
+
+def _with_calendar(monkeypatch, jarvis, ics=SAMPLE_ICS):
+    import httpx
+
+    import jarvis.calendar_ics as cal
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        cal.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=ics)), **kw)
+    )
+    jarvis.calendar.urls = ("https://calendar.test/secret.ics",)
+
+
+def test_habits_streaks_and_claims(monkeypatch, tmp_path: Path):
+    jarvis = _life(monkeypatch, tmp_path)
+    replies = []
+    update = _fake_update(replies, 42)
+    asyncio.run(jarvis.cmd_habit(update, _ctx(args=["sport"])))
+    habit = jarvis.store.habits[0]
+    for d in (1, 2, 3, 4, 5, 6):  # 6 jours d'affilée avant aujourd'hui
+        jarvis.store.check_habit(habit, MONDAY_10H.date() - timedelta(days=d))
+    asyncio.run(jarvis.handle_text(update, _ctx(), "J’ai fait du sport ce matin"))
+    assert "🔥 7 jour(s) d'affilée" in replies[-1] and "Une semaine" in replies[-1]
+    asyncio.run(jarvis.cmd_check(update, _ctx(args=["1"])))
+    assert "déjà coché" in replies[-1]
+    assert jarvis.habit_lines() == ["1. ✅ sport — 🔥 7 j"]
+    assert "Habitudes : 1/1 🎉" in jarvis.daily_summary(MONDAY_10H.date())
+
+
+def test_nudge_rules(monkeypatch, tmp_path: Path):
+    jarvis = _life(monkeypatch, tmp_path)
+    bot = FakeBot()
+    ctx = _ctx(bot)
+    jarvis.store.add_todo("finir le devis", now=MONDAY_10H)
+    jarvis.store.set_setting("last_progress", (MONDAY_10H - timedelta(minutes=30)).isoformat())
+    asyncio.run(jarvis.nudge_check(ctx))
+    assert bot.messages == []  # trop tôt
+
+    jarvis.store.set_setting("last_progress", (MONDAY_10H - timedelta(hours=3)).isoformat())
+    asyncio.run(jarvis.nudge_check(ctx))
+    assert len(bot.messages) == 1 and "finir le devis" in bot.messages[0][1] and "/plustard" in bot.messages[0][1]
+    asyncio.run(jarvis.nudge_check(ctx))
+    assert len(bot.messages) == 1  # pas deux relances d'affilée
+
+    sunday = _life(monkeypatch, tmp_path / "dim", now=MONDAY_10H - timedelta(days=1))
+    sunday.store.add_todo("x", now=MONDAY_10H)
+    sunday.store.set_setting("last_progress", (MONDAY_10H - timedelta(days=2)).isoformat())
+    asyncio.run(sunday.nudge_check(ctx))
+    assert len(bot.messages) == 1  # pas de relance le week-end
+
+
+def test_no_nudge_during_meeting_or_focus(monkeypatch, tmp_path: Path):
+    meeting_time = MONDAY_10H.replace(hour=11, minute=30)  # pendant le dentiste
+    jarvis = _life(monkeypatch, tmp_path, now=meeting_time)
+    _with_calendar(monkeypatch, jarvis)
+    bot = FakeBot()
+    jarvis.store.add_todo("finir le devis", now=MONDAY_10H)
+    jarvis.store.set_setting("last_progress", (MONDAY_10H - timedelta(hours=5)).isoformat())
+    asyncio.run(jarvis.nudge_check(_ctx(bot)))
+    assert bot.messages == []
+    jarvis.calendar.urls = ()
+    jarvis.store.set_focus({"phase": "focus"})
+    asyncio.run(jarvis.nudge_check(_ctx(bot)))
+    assert bot.messages == []
+
+
+def test_postpone_moves_todo_and_resets_nudges(monkeypatch, tmp_path: Path):
+    jarvis = _life(monkeypatch, tmp_path)
+    replies = []
+    for t in ("a", "b", "c"):
+        jarvis.store.add_todo(t, now=MONDAY_10H)
+    asyncio.run(jarvis.cmd_postpone(_fake_update(replies, 42), _ctx()))
+    assert [t["text"] for t in jarvis.store.pending_todos] == ["b", "c", "a"]
+    assert "Maintenant : b" in replies[-1]
+    assert jarvis.store.settings["last_progress"] == MONDAY_10H.isoformat()
+
+
+def test_stats_sends_png_chart(monkeypatch, tmp_path: Path):
+    pytest.importorskip("matplotlib")
+    jarvis = _life(monkeypatch, tmp_path)
+    jarvis.store.log_focus(MONDAY_10H - timedelta(days=1), 50, "x", True)
+    jarvis.store.complete_todo(jarvis.store.add_todo("y", now=MONDAY_10H), MONDAY_10H)
+    bot = FakeBotWithFiles()
+    asyncio.run(jarvis.send_stats(bot, 42, 7))
+    chat_id, png, caption = bot.photos[0]
+    assert png[:4] == b"\x89PNG" and "Concentration : 50 min" in caption and "Tâches cochées : 1" in caption
+
+
+def test_stats_text_fallback_without_matplotlib(monkeypatch, tmp_path: Path):
+    jarvis = _life(monkeypatch, tmp_path)
+    monkeypatch.setattr("jarvis.life.render_png", lambda rows, title: None)
+    bot = FakeBotWithFiles()
+    asyncio.run(jarvis.send_stats(bot, 42, 7))
+    assert bot.photos == [] and "Ta semaine" in bot.messages[0][1]
+
+
+def test_calendar_parsing_and_ics_roundtrip():
+    from jarvis.calendar_ics import fmt_event, make_ics, parse_events
+
+    tz = ZoneInfo("Europe/Paris")
+    day = datetime(2026, 9, 28, tzinfo=tz)
+    events = parse_events([SAMPLE_ICS], day, day + timedelta(days=1), tz)
+    assert [fmt_event(e) for e in events] == [
+        "toute la journée · Anniversaire de Léa",
+        "10:00–11:00 · Réunion équipe (Bureau)",  # 08:00 UTC -> 10:00 à Paris
+        "11:00–12:30 · Dentiste",
+    ]
+    ics = make_ics("🎯 Focus : devis, v2", day.replace(hour=14), day.replace(hour=15), "a;b")
+    back = parse_events([ics.decode()], day, day + timedelta(days=1), tz)
+    assert back[0].title == "🎯 Focus : devis, v2" and back[0].start == day.replace(hour=14)
+
+
+def test_agenda_and_event_reminders(monkeypatch, tmp_path: Path):
+    jarvis = _life(monkeypatch, tmp_path, now=MONDAY_10H.replace(hour=10, minute=50))
+    _with_calendar(monkeypatch, jarvis)
+    agenda = asyncio.run(jarvis.agenda())
+    assert "📅 Agenda du jour" in agenda and "Dentiste" in agenda
+    bot = FakeBot()
+    asyncio.run(jarvis.event_reminder_check(_ctx(bot)))
+    assert [m[1] for m in bot.messages] == ["📅 Dans 10 min : Dentiste"]
+    asyncio.run(jarvis.event_reminder_check(_ctx(bot)))
+    assert len(bot.messages) == 1  # un seul rappel par événement
+
+
+def test_block_finds_free_slot_around_meetings(monkeypatch, tmp_path: Path):
+    jarvis = _life(monkeypatch, tmp_path, now=MONDAY_10H.replace(hour=9, minute=40))
+    _with_calendar(monkeypatch, jarvis)
+    slot = asyncio.run(jarvis.find_focus_slot(90))
+    # 09:45 -> 10:00 trop court, réunion 10-11, dentiste 11-12:30 : premier créneau de 90 min à 12:30
+    assert slot == (MONDAY_10H.replace(hour=12, minute=30), MONDAY_10H.replace(hour=14))
+
+    friday_evening = _life(monkeypatch, tmp_path / "ven", now=datetime(2026, 10, 2, 18, 30, tzinfo=MONDAY_10H.tzinfo))
+    slot = asyncio.run(friday_evening.find_focus_slot(60))
+    assert slot[0] == datetime(2026, 10, 5, 9, 0, tzinfo=MONDAY_10H.tzinfo)  # saute le week-end
+
+
+def test_block_command_sends_ics_and_schedules_reminder(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    jarvis = _life(monkeypatch, tmp_path, now=MONDAY_10H.replace(hour=15))
+    jarvis.store.add_todo("écrire le rapport", now=MONDAY_10H)
+    docs, replies, jq = [], [], FakeJobQueue()
+
+    async def reply_document(data, filename=None, caption=None):
+        docs.append((data, filename, caption))
+
+    update = _fake_update(replies, 42)
+    update.effective_message.reply_document = reply_document
+    asyncio.run(jarvis.cmd_block(update, SimpleNamespace(args=["60"], job_queue=jq, chat_data={})))
+    data, filename, caption = docs[0]
+    assert filename == "focus.ics" and b"SUMMARY:\xf0\x9f\x8e\xaf Focus : \xc3\xa9crire le rapport" in data
+    assert "lundi 28/09 de 15:15 à 16:15" in caption
+    assert jq.jobs and "écrire le rapport" in jarvis.store.reminders[0]["text"]

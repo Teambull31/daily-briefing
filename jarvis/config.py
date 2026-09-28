@@ -26,6 +26,15 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value)
 
 
+def _range(raw: str, default: tuple[int, int]) -> tuple[int, int]:
+    """« 9-19 » -> (9, 19)."""
+    try:
+        a, b = (int(x) for x in raw.split("-", 1))
+        return (a, b) if a < b else default
+    except ValueError:
+        return default
+
+
 def _ids(raw: str) -> frozenset[int]:
     return frozenset(int(x) for x in raw.replace(";", ",").split(",") if x.strip())
 
@@ -35,7 +44,8 @@ AGENT_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 RESERVED_NAMES = frozenset(
     "start aide help ask do projet project taches tasks log stop get reset briefing id agent agents cmd "
     "relancer retry rappel rappels effacer_rappel note memoire oublie suite continue etat status web "
-    "todo todos fait retire next suivant decoupe focus stopfocus bilan voix".split()
+    "todo todos fait retire next suivant decoupe focus stopfocus bilan voix "
+    "habitude habitudes check suppr_habitude plustard stats agenda bloquer".split()
 )
 
 
@@ -75,6 +85,11 @@ class Config:
     review_time: str = ""  # "20:30" pour un bilan quotidien automatique, vide = désactivé
     focus_minutes: int = 25
     break_minutes: int = 5
+    nudge_hours: float = 2  # relance si la tâche prioritaire n'avance pas depuis N heures (0 = jamais)
+    work_hours: tuple[int, int] = (9, 19)  # relances et /bloquer seulement dans ces heures…
+    work_days: tuple[int, int] = (1, 5)  # …et ces jours (1 = lundi, 7 = dimanche)
+    calendar_urls: tuple[str, ...] = ()  # adresses iCal secrètes (Google Agenda, etc.)
+    event_reminder_minutes: int = 15
     searxng_url: str = ""  # ex. http://localhost:8888 ; vide = recherche web désactivée
     progress_minutes: int = 5
     whisper_model: str = "small"
@@ -114,6 +129,11 @@ class Config:
             review_time=env.get("REVIEW_TIME", "").strip(),
             focus_minutes=int(env.get("FOCUS_MINUTES", "25")),
             break_minutes=int(env.get("BREAK_MINUTES", "5")),
+            nudge_hours=float(env.get("NUDGE_HOURS", "2")),
+            work_hours=_range(env.get("WORK_HOURS", "9-19"), (9, 19)),
+            work_days=_range(env.get("WORK_DAYS", "1-5"), (1, 5)),
+            calendar_urls=tuple(u.strip() for u in env.get("CALENDAR_ICS_URLS", "").split(",") if u.strip()),
+            event_reminder_minutes=int(env.get("EVENT_REMINDER_MINUTES", "15")),
             progress_minutes=max(0, int(env.get("PROGRESS_MINUTES", "5"))),
             whisper_model=env.get("WHISPER_MODEL", cls.whisper_model),
             timezone=env.get("TIMEZONE", cls.timezone),
