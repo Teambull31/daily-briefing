@@ -530,3 +530,123 @@ def test_web_answer_when_searxng_is_down():
     finally:
         web.httpx.AsyncClient = real
     assert "SearXNG est-il lancé" in out
+
+
+# ---------- corrections de la relecture ----------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="signaux POSIX")
+def test_cancel_force_kills_agent_ignoring_sigterm(tmp_path: Path, monkeypatch):
+    import jarvis.tasks as tasks_mod
+
+    monkeypatch.setattr(tasks_mod, "FORCE_KILL_DELAY", 0.5)
+    script = tmp_path / "tetu.py"
+    script.write_text(
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('pret', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+
+    async def scenario():
+        tm = tasks_mod.TaskManager(f"{PY} {script.as_posix()}", logs_dir=tmp_path / "logs")
+        task = tm.submit("têtu", tmp_path)
+        while "pret" not in task.tail():
+            await asyncio.sleep(0.05)
+        start = time.time()
+        tm.cancel(task.id)
+        await asyncio.wait_for(asyncio.gather(*tm._runners), 10)
+        return task, time.time() - start
+
+    task, elapsed = asyncio.run(scenario())
+    assert task.status == "annulée" and elapsed < 5
+
+
+def test_stop_without_number_targets_last_active_task(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    from jarvis.tasks import Task
+
+    monkeypatch.setenv("TELEGRAM_TOKEN", "1:x")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    jarvis = Jarvis(Config.from_env())
+    jarvis.tasks.tasks = {
+        1: Task(1, "a", tmp_path, tmp_path / "1.log", status="en cours"),
+        2: Task(2, "b", tmp_path, tmp_path / "2.log", status="terminée"),
+    }
+    assert jarvis._task_from_args(SimpleNamespace(args=[]), active_only=True).id == 1
+    assert jarvis._task_from_args(SimpleNamespace(args=[])).id == 2
+    assert jarvis._task_from_args(SimpleNamespace(args=["#2"]), active_only=True).id == 2
+
+
+def test_think_kept_on_unrelated_400():
+    import httpx
+
+    from jarvis.llm import Ollama
+
+    def handler(req):
+        return httpx.Response(400, json={"error": "prompt too long"})
+
+    async def scenario():
+        o = Ollama("http://x", "m")
+        o._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with pytest.raises(httpx.HTTPStatusError):
+            await o.ask("a")
+        return o.think
+
+    assert asyncio.run(scenario()) is False  # toujours actif (désactivation de la réflexion conservée)
+
+
+def _fake_update(replies, user_id=1):
+    from types import SimpleNamespace
+
+    async def reply_text(text):
+        replies.append(text)
+
+    async def send_action(action):
+        pass
+
+    update = SimpleNamespace(
+        effective_message=SimpleNamespace(reply_text=reply_text),
+        effective_chat=SimpleNamespace(id=user_id, send_action=send_action),
+        effective_user=SimpleNamespace(id=user_id),
+    )
+    return update
+
+
+def test_missing_model_message(monkeypatch, tmp_path: Path):
+    import httpx
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TELEGRAM_TOKEN", "1:x")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    jarvis = Jarvis(Config.from_env())
+    jarvis.llm._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404, json={"error": "model not found"}))
+    )
+    replies = []
+    asyncio.run(jarvis.answer(_fake_update(replies), SimpleNamespace(chat_data={}), "salut"))
+    assert "ollama pull qwen3:14b" in replies[0]
+
+
+def test_error_handler_tells_authorized_user(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TELEGRAM_TOKEN", "1:x")
+    monkeypatch.setenv("ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    jarvis = Jarvis(Config.from_env())
+    monkeypatch.setattr("jarvis.bot.Update", SimpleNamespace)  # nos faux updates passent isinstance()
+    ok, stranger = [], []
+    ctx = SimpleNamespace(error=RuntimeError("boum"))
+    asyncio.run(jarvis.on_error(_fake_update(ok, 1), ctx))
+    asyncio.run(jarvis.on_error(_fake_update(stranger, 999), ctx))
+    assert ok == ["⚠️ Erreur inattendue : RuntimeError: boum"] and stranger == []
+
+
+def test_reminder_prefix_needs_colon_for_bare_rappel():
+    from jarvis.memory import REMINDER_PREFIX
+
+    assert REMINDER_PREFIX.match("rappel: sortir")
+    assert REMINDER_PREFIX.match("Rappelle-moi demain")
+    assert not REMINDER_PREFIX.match("rappel des faits de la guerre de 14")

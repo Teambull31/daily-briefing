@@ -58,7 +58,7 @@ class Ollama:
         if self.think is not None:
             payload["think"] = self.think
         r = await self._client.post(f"{self.base_url}/api/chat", json=payload)
-        if r.status_code == 400 and "think" in payload:
+        if r.status_code == 400 and "think" in payload and "think" in r.text.lower():
             # Ollama trop ancien ou modèle sans option de réflexion : on n'envoie plus le paramètre.
             self.think = None
             del payload["think"]

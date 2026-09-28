@@ -63,7 +63,7 @@ class Store:
 
 # ---------- compréhension des rappels en français ----------
 
-REMINDER_PREFIX = re.compile(r"^\s*(?:rappelle[- ]moi|rappel\s*:?)\s*", re.I)
+REMINDER_PREFIX = re.compile(r"^\s*(?:rappelle[- ]moi|rappel\s*:)\s*", re.I)
 REMEMBER_PREFIX = re.compile(r"^\s*(?:souviens[- ]toi|retiens)\s*(?:que|qu'|:)?\s*", re.I)
 
 _RELATIVE = re.compile(r"\bdans\s+(\d+)\s*(minutes?|mins?|m|heures?|h|jours?|j)\b", re.I)

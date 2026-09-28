@@ -26,6 +26,7 @@ from typing import Awaitable, Callable
 PROMPT_TOKEN = "{prompt}"
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 ACTIVE = ("en attente", "en cours")
+FORCE_KILL_DELAY = 10  # secondes laissées à l'agent pour s'arrêter proprement après /stop
 # Options pour reprendre la dernière session de l'agent dans le même dossier (/suite).
 RESUME_FLAGS = {
     "claude": ["--continue"],
@@ -212,6 +213,8 @@ class TaskManager:
         self._save()
         if task.proc and task.proc.returncode is None:
             _kill_tree(task.proc)
+            # Si l'agent ignore la demande d'arrêt, on force ensuite (sinon la file reste bloquée).
+            asyncio.get_running_loop().call_later(FORCE_KILL_DELAY, _force_kill, task.proc)
         return True
 
     def recent(self, n: int = 10) -> list[Task]:
@@ -255,11 +258,16 @@ def _new_process_group() -> dict:
     return {"start_new_session": True}
 
 
-def _kill_tree(proc: asyncio.subprocess.Process) -> None:
+def _kill_tree(proc: asyncio.subprocess.Process, sig: int = signal.SIGTERM) -> None:
     try:
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
         else:
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.killpg(proc.pid, sig)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def _force_kill(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is None:
+        _kill_tree(proc, getattr(signal, "SIGKILL", signal.SIGTERM))

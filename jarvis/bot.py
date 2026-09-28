@@ -216,6 +216,14 @@ class Jarvis:
         await update.effective_chat.send_action(ChatAction.TYPING)
         try:
             reply = await self.llm.ask(text, history, self.assistant_context())
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                model = self.cfg.chat_model
+                await self.reply(update, f"⚠️ Modèle « {model} » non installé. Sur le PC : ollama pull {model}")
+            else:
+                code, detail = exc.response.status_code, exc.response.text[:300]
+                await self.reply(update, f"⚠️ Erreur d'Ollama ({code}) : {detail}")
+            return
         except httpx.HTTPError as exc:
             await self.reply(update, f"⚠️ Ollama ne répond pas ({exc.__class__.__name__}). Est-il lancé ?")
             return
@@ -392,11 +400,11 @@ class Jarvis:
         lines = [f"#{t.id} [{t.status}, {t.duration}] {t.agent}@{t.cwd.name} : {t.prompt[:60]}" for t in tasks]
         await self.reply(update, "\n".join(lines))
 
-    def _task_from_args(self, context: ContextTypes.DEFAULT_TYPE) -> Task | None:
+    def _task_from_args(self, context: ContextTypes.DEFAULT_TYPE, active_only: bool = False) -> Task | None:
         if context.args and context.args[0].lstrip("#").isdigit():
             return self.tasks.tasks.get(int(context.args[0].lstrip("#")))
-        recent = self.tasks.recent(1)
-        return recent[0] if recent else None
+        candidates = self.tasks.running() if active_only else self.tasks.recent(1)
+        return max(candidates, key=lambda t: t.id, default=None)
 
     async def cmd_log(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         task = self._task_from_args(context)
@@ -407,7 +415,7 @@ class Jarvis:
         await self.reply(update, f"{header}\n\n{task.tail(3500) or '(rien encore)'}")
 
     async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        task = self._task_from_args(context)
+        task = self._task_from_args(context, active_only=True)  # sans numéro : la dernière tâche active
         ok = bool(task) and self.tasks.cancel(task.id)
         await self.reply(update, f"🛑 Tâche #{task.id} arrêtée." if ok else "Rien à arrêter.")
 
@@ -512,11 +520,16 @@ class Jarvis:
             return
         await update.effective_chat.send_action(ChatAction.TYPING)
         media = update.effective_message.voice or update.effective_message.audio
-        tg_file = await media.get_file()
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "voice.ogg"
-            await tg_file.download_to_drive(path)
-            text = await voice.transcribe(path, self.cfg.whisper_model)
+        try:
+            tg_file = await media.get_file()
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "voice.ogg"
+                await tg_file.download_to_drive(path)
+                text = await voice.transcribe(path, self.cfg.whisper_model)
+        except Exception as exc:  # téléchargement Telegram, modèle Whisper absent, audio illisible…
+            log.exception("Transcription impossible")
+            await self.reply(update, f"🎙 Transcription impossible : {exc.__class__.__name__}: {exc}"[:500])
+            return
         if not text:
             await self.reply(update, "🎙 Je n'ai rien compris, tu peux répéter ?")
             return
@@ -548,6 +561,19 @@ class Jarvis:
                 await app.bot.send_message(user_id, text)
             except TelegramError:
                 log.warning("Impossible de prévenir %s des tâches interrompues", user_id)
+
+    async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Toute erreur imprévue est journalisée ET signalée sur le téléphone (plus de silence)."""
+        log.error("Erreur non gérée", exc_info=context.error)
+        if isinstance(update, Update) and update.effective_message:
+            user = update.effective_user
+            if user and user.id in self.cfg.allowed_user_ids:
+                err = context.error
+                try:
+                    text = f"⚠️ Erreur inattendue : {err.__class__.__name__}: {err}"
+                    await update.effective_message.reply_text(text[:500])
+                except TelegramError:
+                    pass
 
     async def daily_briefing(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = await build_briefing(self.cfg, self.llm)
@@ -599,6 +625,7 @@ class Jarvis:
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auth(self.on_text)))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, auth(self.on_voice)))
         app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, auth(self.on_file)))
+        app.add_error_handler(self.on_error)
 
         if self.cfg.briefing_time:
             hour, minute = (int(x) for x in self.cfg.briefing_time.split(":"))
