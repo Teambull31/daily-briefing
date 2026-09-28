@@ -1,0 +1,19 @@
+# Service systemd utilisateur : démarre Jarvis au boot et le relance s'il plante.
+# (Installé automatiquement par deploy/install-fedora.sh.) Installation manuelle :
+#   cp deploy/jarvis.service ~/.config/systemd/user/   # adapter le chemin si le dépôt n'est pas dans ~/daily-briefing
+#   systemctl --user daemon-reload && systemctl --user enable --now jarvis
+#   loginctl enable-linger $USER   # pour qu'il tourne même sans session ouverte
+[Unit]
+Description=Jarvis - assistant pilotable depuis le téléphone
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/daily-briefing
+ExecStart=%h/daily-briefing/.venv/bin/python -m jarvis
+# opencode (~/.opencode/bin) et claude (~/.local/bin) ne sont pas dans le PATH par défaut des services
+Environment=PATH=%h/.opencode/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

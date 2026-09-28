@@ -1,0 +1,11 @@
+python-telegram-bot[job-queue]>=21,<23
+httpx>=0.27
+# Graphiques /stats
+matplotlib>=3.8
+# Agenda (Google Agenda via l'adresse iCal secrète)
+icalendar>=5.0
+recurring-ical-events>=2.0
+# Optionnel : messages vocaux transcrits en local (gratuit)
+# faster-whisper>=1.0
+# Optionnel : voix de Jarvis (rappels et réponses en messages vocaux, gratuit et local)
+# piper-tts>=1.3
