@@ -21,12 +21,20 @@ ROUTER_PROMPT = """Classe la demande suivante.
   (préférence, fait personnel, contexte de ses projets).
 - "web" : une question qui demande des informations récentes ou précises à chercher sur internet
   (actualité, prix, horaires, résultats sportifs, sortie d'un produit, météo ailleurs, documentation).
+- "todo" : ajouter quelque chose à sa liste de choses à faire (sans heure précise).
+- "focus" : démarrer une session de concentration, un pomodoro, un minuteur de travail.
 - "chat" : une simple question, une explication, une conversation, un conseil.
 Réponds UNIQUEMENT en JSON, par exemple {"action": "chat"}.
 
 Demande : """
 
-ACTIONS = ("task", "reminder", "remember", "web", "chat")
+ACTIONS = ("task", "reminder", "remember", "web", "todo", "focus", "chat")
+
+BREAKDOWN_PROMPT = """Découpe cet objectif en 3 à 8 étapes concrètes et dans l'ordre, chacune faisable
+en moins de 30 minutes et commençant par un verbe d'action. Sois précis, pas de généralités.
+Réponds UNIQUEMENT en JSON : {{"etapes": ["...", "..."]}}
+
+Objectif : {goal}"""
 
 WHEN_PROMPT = """Nous sommes le {now} ({weekday}). Extrais le rappel demandé ci-dessous.
 Réponds UNIQUEMENT en JSON : {{"datetime": "AAAA-MM-JJTHH:MM", "texte": "ce qu'il faut rappeler"}}.
@@ -91,6 +99,15 @@ class Ollama:
             return None
         what = str(data.get("texte") or "").strip() or "(rappel)"
         return (when, what) if when > now else None
+
+    async def breakdown(self, goal: str) -> list[str]:
+        """Découpe une grosse tâche en petites étapes (liste vide si l'IA échoue)."""
+        try:
+            raw = await self.chat([{"role": "user", "content": BREAKDOWN_PROMPT.format(goal=goal)}], json_mode=True)
+            steps = json.loads(raw).get("etapes", [])
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return []
+        return [str(s).strip() for s in steps if str(s).strip()][:8]
 
     async def aclose(self) -> None:
         await self._client.aclose()

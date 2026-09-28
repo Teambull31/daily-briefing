@@ -22,11 +22,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from . import voice
 from .briefing import build_briefing
+from .coach import FOCUS_PREFIX, TODO_PREFIX, CoachMixin, extract_todo
 from .config import Config
 from .llm import WEEKDAYS, Ollama
 from .memory import REMEMBER_PREFIX, REMINDER_PREFIX, Store, parse_reminder
 from .status import ollama_lines, system_lines
 from .tasks import ACTIVE, Task, TaskManager, supports_resume
+from .tts import Speaker
 from .web import web_answer
 
 log = logging.getLogger("jarvis")
@@ -61,11 +63,21 @@ HELP = """🤖 Jarvis — tes commandes
 /reset — oublie la conversation
 /id — ton identifiant Telegram
 
+🎯 Productivité
+/todo <chose> — ajoute à ta liste (« ! » devant = urgent, une par ligne)
+/todos — ta liste · /fait [n] — coche · /retire <n>
+/next — LA prochaine chose à faire, rien d'autre
+/decoupe <gros objectif> — je le découpe en petites étapes
+/focus [min] [xN] [sujet] — session de concentration (pomodoro)
+/stopfocus — arrête la session · /bilan — ta journée
+/voix off|rappels|tout — rappels et réponses en messages vocaux
+
 🎙 Les messages vocaux marchent aussi (si faster-whisper est installé).
 📎 Envoie un fichier ou une photo : il est rangé dans le projet actif (dossier inbox/).
    Avec une légende, je traite la légende comme une demande sur ce fichier.
 
-Tu peux aussi parler naturellement : « rappelle-moi dans 20 min de… », « souviens-toi que… »."""
+Tu peux aussi parler naturellement : « rappelle-moi dans 20 min de… », « souviens-toi que… »,
+« ajoute à ma liste … », « focus 45 min sur le rapport »."""
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -86,7 +98,7 @@ def resolve_inside(base: Path, rel: str) -> Path | None:
     return target if target.is_relative_to(base.resolve()) else None
 
 
-class Jarvis:
+class Jarvis(CoachMixin):
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.llm = Ollama(cfg.ollama_url, cfg.chat_model, think=cfg.chat_think)
@@ -97,6 +109,7 @@ class Jarvis:
         cfg.workspace.mkdir(parents=True, exist_ok=True)
         self.store = Store(cfg.workspace / ".jarvis-memoire.json")
         self.tz = ZoneInfo(cfg.timezone)
+        self.speaker = Speaker(cfg.tts_voice, cfg.workspace / ".voix") if Speaker.available() else None
 
     # ---------- utilitaires ----------
 
@@ -151,6 +164,12 @@ class Jarvis:
         if REMEMBER_PREFIX.match(text):
             await self.remember(update, REMEMBER_PREFIX.sub("", text, count=1))
             return
+        if TODO_PREFIX.match(text):
+            await self.add_todos(update, text)
+            return
+        if FOCUS_PREFIX.match(text):
+            await self.start_focus(update, context, text)
+            return
         if self.cfg.auto_route:
             await update.effective_chat.send_action(ChatAction.TYPING)
             action = await self.llm.route(text)
@@ -165,6 +184,12 @@ class Jarvis:
                 return
             if action == "web" and self.cfg.searxng_url:
                 await self.web(update, text)
+                return
+            if action == "todo" and extract_todo(text):
+                await self.add_todos(update, text)
+                return
+            if action == "focus":
+                await self.start_focus(update, context, text)
                 return
         await self.answer(update, context, text)
 
@@ -208,7 +233,7 @@ class Jarvis:
     async def _fire_reminder(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         reminder = next((r for r in self.store.reminders if r["id"] == context.job.data), None)
         if reminder:
-            await context.bot.send_message(reminder["chat_id"], f"⏰ Rappel : {reminder['text']}")
+            await self.notify(context.bot, reminder["chat_id"], f"⏰ Rappel : {reminder['text']}")
             self.store.remove_reminder(reminder["id"])
 
     async def answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -230,6 +255,8 @@ class Jarvis:
         history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
         del history[: -2 * HISTORY_TURNS]
         await self.reply(update, reply)
+        if self.voice_mode == "tout":
+            await self.send_voice(context.bot, update.effective_chat.id, reply)
 
     async def start_task(
         self,
@@ -262,8 +289,9 @@ class Jarvis:
                 text += f"\n\n💡 Réessayer avec un autre agent : /{others[0]} <tâche>"
             elif task.status == "terminée" and supports_resume(self.cfg.agents.get(task.agent, "")):
                 text += "\n\n↪️ /suite <message> pour continuer dans la même session"
+            silent = self.focus_active()  # pendant une session de concentration : pas de sonnerie
             for chunk in split_message(text):
-                await context.bot.send_message(chat_id, chunk)
+                await context.bot.send_message(chat_id, chunk, disable_notification=silent)
 
         task = self.tasks.submit(prompt, cwd, on_done, agent, resume)
         status_msg = await update.effective_message.reply_text(
@@ -509,7 +537,10 @@ class Jarvis:
 
     async def cmd_briefing(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_chat.send_action(ChatAction.TYPING)
-        await self.reply(update, await build_briefing(self.cfg, self.llm))
+        text = await build_briefing(self.cfg, self.llm, self.agenda())
+        await self.reply(update, text)
+        if self.voice_mode != "off":
+            await self.send_voice(context.bot, update.effective_chat.id, text)
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.handle_text(update, context, update.effective_message.text)
@@ -537,6 +568,7 @@ class Jarvis:
         await self.handle_text(update, context, text)
 
     async def _on_startup(self, app: Application) -> None:
+        self.restore_focus(app.job_queue)
         # Rappels : on reprogramme ceux à venir, on envoie ceux manqués pendant que le PC était éteint.
         now = self.now()
         for reminder in self.store.reminders:
@@ -576,10 +608,12 @@ class Jarvis:
                     pass
 
     async def daily_briefing(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        text = await build_briefing(self.cfg, self.llm)
+        text = await build_briefing(self.cfg, self.llm, self.agenda())
         for user_id in self.cfg.allowed_user_ids:
-            for chunk in split_message(text):
-                await context.bot.send_message(user_id, chunk)
+            try:
+                await self.notify(context.bot, user_id, text[:4000])
+            except TelegramError:
+                log.warning("Briefing non envoyé à %s", user_id)
 
     # ---------- assemblage ----------
 
@@ -618,6 +652,16 @@ class Jarvis:
             (["get"], self.cmd_get),
             (["reset"], self.cmd_reset),
             (["briefing"], self.cmd_briefing),
+            (["todo"], self.cmd_todo),
+            (["todos"], self.cmd_todos),
+            (["fait"], self.cmd_done),
+            (["retire"], self.cmd_remove_todo),
+            (["next", "suivant"], self.cmd_next),
+            (["decoupe"], self.cmd_breakdown),
+            (["focus"], self.cmd_focus),
+            (["stopfocus"], self.cmd_stop_focus),
+            (["bilan"], self.cmd_review),
+            (["voix"], self.cmd_voice),
         ]:
             app.add_handler(CommandHandler(names, auth(fn)))
         for name in self.cfg.agents:
@@ -632,6 +676,9 @@ class Jarvis:
             app.job_queue.run_daily(
                 self.daily_briefing, time=dtime(hour, minute, tzinfo=ZoneInfo(self.cfg.timezone))
             )
+        if self.cfg.review_time:
+            hour, minute = (int(x) for x in self.cfg.review_time.split(":"))
+            app.job_queue.run_daily(self.evening_review, time=dtime(hour, minute, tzinfo=self.tz))
         return app
 
 

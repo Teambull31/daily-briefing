@@ -64,7 +64,7 @@ async def fetch_headlines(client: httpx.AsyncClient, feeds: tuple[str, ...]) -> 
     return [t for titles in results for t in titles]
 
 
-async def build_briefing(cfg: Config, llm: Ollama | None) -> str:
+async def build_briefing(cfg: Config, llm: Ollama | None, agenda: str = "") -> str:
     now = datetime.now(ZoneInfo(cfg.timezone))
     async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "jarvis-briefing"}) as client:
         try:
@@ -74,6 +74,8 @@ async def build_briefing(cfg: Config, llm: Ollama | None) -> str:
         headlines = await fetch_headlines(client, cfg.feeds)
 
     header = f"☀️ Briefing du {now:%d/%m/%Y}\n\n🌦 {weather}\n"
+    if agenda:
+        header += f"\n{agenda}\n"
     if not headlines:
         return header + "\n📰 Aucune actualité récupérée."
     raw = "\n".join(f"- {h}" for h in headlines)

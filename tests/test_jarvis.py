@@ -15,6 +15,13 @@ from jarvis.tasks import TaskManager, agent_env, build_argv
 PY = sys.executable.replace("\\", "/")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_voice(monkeypatch):
+    """Pas de synthèse vocale réelle (ni de téléchargement de voix) pendant les tests."""
+    monkeypatch.setenv("VOICE_MODE", "off")
+    monkeypatch.setattr("jarvis.tts.Speaker.available", staticmethod(lambda: False))
+
+
 def test_build_argv_keeps_prompt_as_single_argument():
     argv = build_argv("echo --flag {prompt}", "rm -rf / ; $(whoami)")
     assert argv[1:] == ["--flag", "rm -rf / ; $(whoami)"]
@@ -367,7 +374,7 @@ def test_reminder_flow_end_to_end(monkeypatch, tmp_path: Path):
     async def reply_text(text):
         replies.append(text)
 
-    async def send_message(chat_id, text):
+    async def send_message(chat_id, text, **kw):
         sent.append((chat_id, text))
 
     update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply_text),
@@ -650,3 +657,238 @@ def test_reminder_prefix_needs_colon_for_bare_rappel():
     assert REMINDER_PREFIX.match("rappel: sortir")
     assert REMINDER_PREFIX.match("Rappelle-moi demain")
     assert not REMINDER_PREFIX.match("rappel des faits de la guerre de 14")
+
+
+# ---------- coach de productivité ----------
+
+
+class FakeBot:
+    def __init__(self):
+        self.messages, self.voices, self.audios = [], [], []
+
+    async def send_message(self, chat_id, text, disable_notification=False, **kw):
+        self.messages.append((chat_id, text, disable_notification))
+
+    async def send_voice(self, chat_id, audio, disable_notification=False, **kw):
+        self.voices.append((chat_id, audio))
+
+    async def send_audio(self, chat_id, audio, filename=None, disable_notification=False, **kw):
+        self.audios.append((chat_id, audio, filename))
+
+
+class FakeJobQueue:
+    def __init__(self):
+        self.jobs = []
+
+    def run_once(self, callback, when, data=None, name=None):
+        self.jobs.append((callback, when, name))
+
+    def get_jobs_by_name(self, name):
+        return []
+
+
+def _coach(monkeypatch, tmp_path, **env):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "1:x")
+    monkeypatch.setenv("ALLOWED_USER_IDS", "42")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    return Jarvis(Config.from_env())
+
+
+def _ctx(bot=None, jq=None, args=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(bot=bot or FakeBot(), job_queue=jq or FakeJobQueue(), chat_data={}, args=args or [])
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("todo: acheter du pain", "acheter du pain"),
+        ("ajoute à ma liste appeler le comptable", "appeler le comptable"),
+        ("ajoute appeler Paul à ma liste", "appeler Paul"),
+        ("ajoute à ma liste de choses à faire : réviser le chapitre 3", "réviser le chapitre 3"),
+        ("mets finir le devis dans ma liste de tâches", "finir le devis"),
+    ],
+)
+def test_extract_todo(text, expected):
+    from jarvis.coach import extract_todo
+
+    assert extract_todo(text) == expected
+
+
+def test_todo_store_order_and_completion(tmp_path: Path):
+    store = Store(tmp_path / "m.json")
+    store.add_todo("b", now=NOW)
+    store.add_todo("c", now=NOW)
+    store.add_todo("a urgent", urgent=True, now=NOW)
+    assert [t["text"] for t in store.pending_todos] == ["a urgent", "b", "c"]
+    store.complete_todo(store.pending_by_number(2), NOW)
+    assert [t["text"] for t in store.pending_todos] == ["a urgent", "c"]
+    assert [t["text"] for t in store.done_on(NOW.date())] == ["b"]
+    assert store.pending_by_number(9) is None
+    store.purge_old_done(NOW + timedelta(days=1))
+    assert [t["text"] for t in Store(tmp_path / "m.json").todos] == ["a urgent", "c"]
+
+
+def test_parse_focus():
+    from jarvis.memory import parse_focus
+
+    assert parse_focus("") == (25, 1, "")
+    assert parse_focus("45 min sur le rapport client") == (45, 1, "le rapport client")
+    assert parse_focus("50 minutes 3 sessions sur le site") == (50, 3, "le site")
+    assert parse_focus("je me concentre pendant 30 min sur la compta") == (30, 1, "la compta")
+    assert parse_focus("x4 révisions", default_minutes=20) == (20, 4, "révisions")
+    assert parse_focus("999") == (180, 1, "")  # borné
+
+
+def test_focus_full_cycle(monkeypatch, tmp_path: Path):
+    jarvis = _coach(monkeypatch, tmp_path)
+    jarvis.store.add_todo("écrire l'intro", now=NOW)
+    replies, bot, jq = [], FakeBot(), FakeJobQueue()
+    update = _fake_update(replies, 42)
+    ctx = _ctx(bot, jq)
+
+    asyncio.run(jarvis.start_focus(update, ctx, "25 x2"))
+    session = jarvis.store.focus
+    assert session["topic"] == "écrire l'intro" and session["rounds"] == 2  # sujet = prochaine tâche
+    assert "C'est parti : 25 min" in replies[-1] and jarvis.focus_active()
+
+    asyncio.run(jarvis.start_focus(update, ctx, "10"))  # déjà en cours
+    assert "Déjà en concentration" in replies[-1]
+
+    tick = jq.jobs[-1][0]
+    asyncio.run(tick(ctx))  # fin session 1 -> pause
+    assert jarvis.store.focus["phase"] == "break" and "Session 1/2 terminée" in bot.messages[-1][1]
+    asyncio.run(tick(ctx))  # fin pause -> session 2
+    assert jarvis.store.focus["round"] == 2 and "session 2/2" in bot.messages[-1][1]
+    asyncio.run(tick(ctx))  # fin session 2 -> dernière pause
+    assert "2 session(s), 50 min" in bot.messages[-1][1] and "/fait" in bot.messages[-1][1]
+    asyncio.run(tick(ctx))  # fin de la pause -> relance vers la prochaine étape
+    assert jarvis.store.focus is None and "Prochaine étape : écrire l'intro" in bot.messages[-1][1]
+    assert jarvis.store.focus_minutes_on(jarvis.now().date()) == (2, 50)
+
+
+def test_stop_focus_logs_partial_time(monkeypatch, tmp_path: Path):
+    jarvis = _coach(monkeypatch, tmp_path)
+    replies = []
+    ctx = _ctx()
+    asyncio.run(jarvis.start_focus(_fake_update(replies, 42), ctx, "30 sur le devis"))
+    session = jarvis.store.focus
+    session["end"] = (jarvis.now() + timedelta(minutes=18)).isoformat()  # 12 min déjà faites
+    jarvis.store.set_focus(session)
+    asyncio.run(jarvis.cmd_stop_focus(_fake_update(replies, 42), ctx))
+    assert jarvis.store.focus is None
+    assert jarvis.store.data["focus_log"][-1]["minutes"] == 12
+    assert jarvis.store.data["focus_log"][-1]["completed"] is False
+
+
+def test_task_notifications_are_silent_during_focus(monkeypatch, tmp_path: Path):
+    jarvis = _coach(monkeypatch, tmp_path, AGENT_LOCAL=f'{PY} -c "print(1)"')
+    bot, replies = FakeBot(), []
+
+    async def scenario():
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(bot=bot, job_queue=None, chat_data={}, args=[])
+        await jarvis.start_focus(_fake_update(replies, 42), _ctx(bot), "25")
+        await jarvis.start_task(_fake_update(replies, 42), ctx, "tâche")
+        await asyncio.gather(*jarvis.tasks._runners)
+
+    asyncio.run(scenario())
+    done = [m for m in bot.messages if "Tâche #1" in m[1]]
+    assert done and all(silent for _, _, silent in done)
+
+
+def test_voice_notes_follow_mode(monkeypatch, tmp_path: Path):
+    jarvis = _coach(monkeypatch, tmp_path)
+
+    class FakeSpeaker:
+        fmt = "ogg"
+
+        async def speak(self, text):
+            return (b"OggS" + text.encode(), self.fmt)
+
+    jarvis.speaker = FakeSpeaker()
+    bot = FakeBot()
+    asyncio.run(jarvis.notify(bot, 42, "⏰ Rappel : sortir"))
+    assert bot.voices == []  # VOICE_MODE=off (tests)
+
+    jarvis.store.set_setting("voice", "rappels")
+    asyncio.run(jarvis.notify(bot, 42, "⏰ Rappel : sortir"))
+    assert bot.messages[-1][1] == "⏰ Rappel : sortir" and len(bot.voices) == 1
+
+    jarvis.speaker.fmt = "wav"  # pas de ffmpeg : fichier audio au lieu d'un vocal
+    asyncio.run(jarvis.notify(bot, 42, "x"))
+    assert bot.audios[-1][2] == "jarvis.wav"
+
+    class BrokenSpeaker:
+        async def speak(self, text):
+            raise RuntimeError("voix absente")
+
+    jarvis.speaker = BrokenSpeaker()
+    asyncio.run(jarvis.notify(bot, 42, "texte quand même"))
+    assert bot.messages[-1][1] == "texte quand même"  # la voix ne bloque jamais le texte
+
+
+def test_voice_command_changes_mode(monkeypatch, tmp_path: Path):
+    jarvis = _coach(monkeypatch, tmp_path)
+    replies = []
+    asyncio.run(jarvis.cmd_voice(_fake_update(replies, 42), _ctx(args=["tout"])))
+    assert jarvis.voice_mode == "tout" and "Mode vocal : tout" in replies[-1]
+    asyncio.run(jarvis.cmd_voice(_fake_update(replies, 42), _ctx(args=["n'importe"])))
+    assert jarvis.voice_mode == "tout"
+
+
+def test_todo_commands_and_next(monkeypatch, tmp_path: Path):
+    jarvis = _coach(monkeypatch, tmp_path)
+    replies = []
+    update = _fake_update(replies, 42)
+    asyncio.run(jarvis.add_todos(update, "rédiger le devis\n! appeler le client\nenvoyer la facture"))
+    assert "3 tâches" in replies[-1]
+    asyncio.run(jarvis.cmd_next(update, _ctx()))
+    assert "appeler le client" in replies[-1]  # l'urgent passe en premier
+    asyncio.run(jarvis.cmd_done(update, _ctx()))  # sans numéro : la première
+    assert "« appeler le client » est fait" in replies[-1] and "Ensuite : rédiger le devis" in replies[-1]
+    asyncio.run(jarvis.cmd_done(update, _ctx(args=["2"])))
+    assert "envoyer la facture" in replies[-1]
+    asyncio.run(jarvis.cmd_todos(update, _ctx()))
+    assert "1. rédiger le devis" in replies[-1] and "Faites aujourd'hui : 2" in replies[-1]
+    summary = jarvis.daily_summary(jarvis.now().date())
+    assert "Tâches cochées : 2" in summary and "rédiger le devis" in summary
+    assert "📝 À faire aujourd'hui" in jarvis.agenda()
+
+
+def test_breakdown_adds_steps(monkeypatch, tmp_path: Path):
+    import httpx
+
+    jarvis = _coach(monkeypatch, tmp_path)
+    steps = '{"etapes": ["Lister les pages", "Écrire la page d\'accueil", "Mettre en ligne"]}'
+    jarvis.llm._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"message": {"content": steps}}))
+    )
+    replies = []
+    asyncio.run(jarvis.cmd_breakdown(_fake_update(replies, 42), _ctx(args=["créer", "mon", "site"])))
+    assert [t["text"] for t in jarvis.store.pending_todos] == [
+        "Lister les pages", "Écrire la page d'accueil", "Mettre en ligne"
+    ]
+    assert "créer mon site" in replies[-1]
+
+
+def test_natural_language_todo_and_focus_shortcuts(monkeypatch, tmp_path: Path):
+    jarvis = _coach(monkeypatch, tmp_path)
+    replies = []
+    ctx = _ctx()
+    asyncio.run(jarvis.handle_text(_fake_update(replies, 42), ctx, "ajoute à ma liste réserver le garage"))
+    assert jarvis.store.pending_todos[0]["text"] == "réserver le garage"
+    asyncio.run(jarvis.handle_text(_fake_update(replies, 42), ctx, "focus 40 min sur la compta"))
+    assert jarvis.store.focus["minutes"] == 40 and jarvis.store.focus["topic"] == "la compta"
+
+
+def test_clean_for_speech():
+    from jarvis.tts import clean_for_speech
+
+    assert clean_for_speech("⏰ ⏱️ Rappel : **sortir** 🎉 https://x.y /rappels") == "Rappel : sortir"
+    long_text = "Phrase courte. " * 100
+    assert len(clean_for_speech(long_text)) <= 600 and clean_for_speech(long_text).endswith(".")

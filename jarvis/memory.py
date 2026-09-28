@@ -1,4 +1,5 @@
-"""Mémoire à long terme (notes sur l'utilisateur) et rappels, stockés dans un fichier JSON."""
+"""Mémoire de Jarvis, stockée dans un fichier JSON : notes sur l'utilisateur, rappels,
+liste de tâches (todos), sessions de concentration et réglages."""
 
 from __future__ import annotations
 
@@ -11,7 +12,10 @@ from pathlib import Path
 class Store:
     def __init__(self, path: Path):
         self.path = path
-        self.data: dict = {"notes": [], "reminders": [], "next_id": 1}
+        self.data: dict = {
+            "notes": [], "reminders": [], "next_id": 1,
+            "todos": [], "focus": None, "focus_log": [], "settings": {},
+        }
         if path.is_file():
             try:
                 self.data.update(json.loads(path.read_text(encoding="utf-8")))
@@ -53,6 +57,84 @@ class Store:
         self.data["reminders"] = [r for r in self.data["reminders"] if r["id"] != reminder_id]
         self.save()
         return len(self.data["reminders"]) < before
+
+    # ---------- liste de tâches ----------
+
+    @property
+    def todos(self) -> list[dict]:
+        return self.data["todos"]
+
+    @property
+    def pending_todos(self) -> list[dict]:
+        return [t for t in self.todos if not t["done"]]
+
+    def add_todo(self, text: str, urgent: bool = False, now: datetime | None = None) -> dict:
+        todo = {
+            "id": self.data["next_id"], "text": text.strip(), "done": False,
+            "created": (now or datetime.now()).isoformat(), "done_at": None,
+        }
+        self.data["next_id"] += 1
+        if urgent:  # en tête de liste : ce sera le prochain /next
+            self.todos.insert(0, todo)
+        else:
+            self.todos.append(todo)
+        self.save()
+        return todo
+
+    def pending_by_number(self, number: int) -> dict | None:
+        """Les todos sont affichés numérotés 1, 2, 3… dans l'ordre de la liste en attente."""
+        pending = self.pending_todos
+        return pending[number - 1] if 1 <= number <= len(pending) else None
+
+    def complete_todo(self, todo: dict, now: datetime) -> None:
+        todo["done"], todo["done_at"] = True, now.isoformat()
+        self.save()
+
+    def remove_todo(self, todo: dict) -> None:
+        self.todos.remove(todo)
+        self.save()
+
+    def done_on(self, day) -> list[dict]:
+        return [t for t in self.todos if t["done_at"] and datetime.fromisoformat(t["done_at"]).date() == day]
+
+    def purge_old_done(self, before: datetime) -> None:
+        """Garde la liste légère : on oublie les todos terminés depuis longtemps."""
+        self.data["todos"] = [
+            t for t in self.todos if not t["done_at"] or datetime.fromisoformat(t["done_at"]) >= before
+        ]
+        self.save()
+
+    # ---------- concentration ----------
+
+    @property
+    def focus(self) -> dict | None:
+        return self.data["focus"]
+
+    def set_focus(self, session: dict | None) -> None:
+        self.data["focus"] = session
+        self.save()
+
+    def log_focus(self, start: datetime, minutes: int, topic: str, completed: bool) -> None:
+        self.data["focus_log"].append(
+            {"start": start.isoformat(), "minutes": minutes, "topic": topic, "completed": completed}
+        )
+        self.data["focus_log"] = self.data["focus_log"][-500:]
+        self.save()
+
+    def focus_minutes_on(self, day) -> tuple[int, int]:
+        """(nombre de sessions, minutes de concentration) pour un jour donné."""
+        sessions = [f for f in self.data["focus_log"] if datetime.fromisoformat(f["start"]).date() == day]
+        return len(sessions), sum(f["minutes"] for f in sessions)
+
+    # ---------- réglages ----------
+
+    @property
+    def settings(self) -> dict:
+        return self.data["settings"]
+
+    def set_setting(self, key: str, value) -> None:
+        self.settings[key] = value
+        self.save()
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,3 +198,29 @@ def parse_reminder(text: str, now: datetime) -> tuple[datetime, str] | None:
         body = body[:start] + " " + body[end:]
     what = _LEADING_JUNK.sub("", re.sub(r"\s+", " ", body).strip()).strip(" .!,")
     return when, what or "(rappel)"
+
+
+# ---------- sessions de concentration ----------
+
+_FOCUS_MINUTES = re.compile(r"\b(\d{1,3})\s*(?:min(?:utes?)?|mn|m)?\b", re.I)
+_FOCUS_ROUNDS = re.compile(r"\b[x×]\s*(\d{1,2})\b|\b(\d{1,2})\s*(?:sessions?|fois|pomodoros?)\b", re.I)
+_FOCUS_WORDS = re.compile(
+    r"^\s*(?:je\s+(?:me\s+)?(?:concentre|bosse|travaille)|concentration|focus|pomodoro|lance\s+(?:un\s+)?focus)"
+    r"(?:\s+(?:pendant|de|sur|pour))?\s*",
+    re.I,
+)
+
+
+def parse_focus(text: str, default_minutes: int = 25) -> tuple[int, int, str]:
+    """« 45 min x2 sur le rapport » -> (45, 2, "le rapport"). Minutes bornées à 5–180."""
+    body = _FOCUS_WORDS.sub("", text, count=1)
+    rounds = 1
+    if m := _FOCUS_ROUNDS.search(body):
+        rounds = int(m.group(1) or m.group(2))
+        body = body[: m.start()] + " " + body[m.end():]
+    minutes = default_minutes
+    if m := _FOCUS_MINUTES.search(body):
+        minutes = int(m.group(1))
+        body = body[: m.start()] + " " + body[m.end():]
+    topic = re.sub(r"^(?:sur|pour|de|:|-)\s+", "", re.sub(r"\s+", " ", body).strip(), flags=re.I).strip(" .")
+    return max(5, min(180, minutes)), max(1, min(12, rounds)), topic

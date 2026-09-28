@@ -35,7 +35,7 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 step "Paquets système"
-sudo dnf install -y git python3 python3-pip curl zstd pciutils podman
+sudo dnf install -y git python3 python3-pip curl zstd pciutils podman ffmpeg-free
 
 step "Ollama (IA locale, accélérée par ta Radeon via ROCm)"
 if command -v ollama >/dev/null; then
@@ -75,8 +75,20 @@ step "Environnement Python de Jarvis"
 cd "$REPO_DIR"
 [[ -d .venv ]] || python3 -m venv .venv
 .venv/bin/pip install -q --upgrade pip
-.venv/bin/pip install -q -r requirements.txt faster-whisper
-info "Dépendances installées (vocal compris)."
+.venv/bin/pip install -q -r requirements.txt faster-whisper piper-tts
+info "Dépendances installées (reconnaissance vocale et voix de Jarvis comprises)."
+# Voix française de Jarvis (Piper, ~60 Mo), téléchargée maintenant plutôt qu'au premier rappel.
+WORKSPACE_DIR="$(grep -E '^WORKSPACE=' .env.example | cut -d= -f2- | sed "s|^~|$HOME|")"
+if .venv/bin/python -c "
+import sys
+from pathlib import Path
+from piper.download_voices import download_voice
+download_voice('fr_FR-siwis-medium', Path(sys.argv[1]) / '.voix')
+" "$WORKSPACE_DIR"; then
+    info "✅ Voix française installée."
+else
+    info "⚠️  Voix non téléchargée : elle le sera au premier rappel."
+fi
 
 step "OpenCode (agent de code gratuit)"
 export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"

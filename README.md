@@ -57,7 +57,7 @@ git checkout claude/mobile-jarvis-assistant-klqx0n   # tant que ce n'est pas fus
 ```
 
 Le script installe et configure tout : Ollama avec ROCm (l'accélération AMD), les modèles, Python,
-OpenCode, le vocal, la recherche web (SearXNG dans Podman, en option), le bot Telegram (il récupère ton identifiant tout seul), Claude Code en option,
+OpenCode, le vocal (reconnaissance + voix de Jarvis), la recherche web (SearXNG dans Podman, en option), le bot Telegram (il récupère ton identifiant tout seul), Claude Code en option,
 le démarrage automatique et la désactivation de la veille. Il te pose 3-4 questions, rien d'autre.
 Compte ~30 Go de téléchargement pour les modèles.
 
@@ -143,6 +143,26 @@ L'agent **exécute des commandes sur ton PC**. Donc :
 - Idéalement, lance Jarvis dans **WSL**, une VM ou un compte utilisateur dédié, pas sur ta session principale.
 - Chaque projet est un dépôt git : tu vois quels fichiers ont changé, et tu peux annuler.
 - Ne mets jamais le token Telegram dans git (`.env` est ignoré).
+
+## Coach de productivité : finir ce que tu commences
+
+| Tu envoies | Jarvis fait |
+|---|---|
+| `/todo rédiger le devis` (une tâche par ligne, `!` devant = urgent) ou « ajoute à ma liste … » | L'ajoute à ta liste |
+| `/next` | Te donne **une seule** chose à faire maintenant, pas toute la liste |
+| `/decoupe créer le site de l'asso` | L'IA découpe l'objectif en 3 à 8 petites étapes concrètes (< 30 min), ajoutées à ta liste |
+| `/focus` · `/focus 45 x3 sur le rapport` · « focus 30 min sur la compta » | Session de concentration (pomodoro) ; sans sujet, prend ta prochaine tâche. Pause, reprise, relance automatique |
+| `/fait` (ou `/fait 2`) | Coche, te félicite et te dit quoi faire ensuite |
+| `/bilan` | Tâches cochées, minutes de concentration, travail de l'agent, ce qui reste |
+| `/voix off\|rappels\|tout` | Rappels, fins de focus, briefing et bilan en **messages vocaux** (et même tes réponses avec `tout`) |
+
+- **Rappels audio** : voix française générée en local par [Piper](https://github.com/OHF-Voice/piper1-gpl)
+  (gratuit, ~0,5 s par phrase sur le processeur), envoyée en vrai message vocal Telegram (via ffmpeg).
+  Avec `PC_AUDIO=1`, elle est aussi jouée sur les haut-parleurs du PC.
+- **Pendant un focus**, les notifications de fin de tâche de l'agent arrivent **sans sonnerie** ; seuls tes rappels sonnent.
+- **Rituels** : le briefing du matin inclut ta liste du jour, tes rappels du jour et ta concentration d'hier ;
+  le bilan du soir (`REVIEW_TIME=20:30`) te demande par quoi commencer demain.
+- La session de focus survit à un redémarrage du PC ; une session arrêtée compte quand même le temps passé.
 
 ## Alterner entre modèles gratuits et Claude Code (abonnement)
 

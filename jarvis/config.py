@@ -34,7 +34,8 @@ AGENT_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 # Noms déjà pris par les commandes du bot : un agent ne peut pas s'appeler comme elles.
 RESERVED_NAMES = frozenset(
     "start aide help ask do projet project taches tasks log stop get reset briefing id agent agents cmd "
-    "relancer retry rappel rappels effacer_rappel note memoire oublie suite continue etat status web".split()
+    "relancer retry rappel rappels effacer_rappel note memoire oublie suite continue etat status web "
+    "todo todos fait retire next suivant decoupe focus stopfocus bilan voix".split()
 )
 
 
@@ -68,6 +69,12 @@ class Config:
     max_parallel_tasks: int = 1
     auto_route: bool = True
     chat_think: bool = False
+    tts_voice: str = "fr_FR-siwis-medium"
+    voice_mode: str = "rappels"  # off | rappels (rappels, focus, briefing, bilan) | tout (réponses aussi)
+    pc_audio: bool = False  # lire aussi rappels et fins de focus sur les haut-parleurs du PC
+    review_time: str = ""  # "20:30" pour un bilan quotidien automatique, vide = désactivé
+    focus_minutes: int = 25
+    break_minutes: int = 5
     searxng_url: str = ""  # ex. http://localhost:8888 ; vide = recherche web désactivée
     progress_minutes: int = 5
     whisper_model: str = "small"
@@ -101,6 +108,12 @@ class Config:
             auto_route=env.get("AUTO_ROUTE", "1") not in ("0", "false", "no"),
             chat_think=env.get("CHAT_THINK", "0") in ("1", "true", "yes"),
             searxng_url=env.get("SEARXNG_URL", "").strip().rstrip("/"),
+            tts_voice=env.get("TTS_VOICE", cls.tts_voice),
+            voice_mode=env.get("VOICE_MODE", cls.voice_mode).strip().lower(),
+            pc_audio=env.get("PC_AUDIO", "0") in ("1", "true", "yes"),
+            review_time=env.get("REVIEW_TIME", "").strip(),
+            focus_minutes=int(env.get("FOCUS_MINUTES", "25")),
+            break_minutes=int(env.get("BREAK_MINUTES", "5")),
             progress_minutes=max(0, int(env.get("PROGRESS_MINUTES", "5"))),
             whisper_model=env.get("WHISPER_MODEL", cls.whisper_model),
             timezone=env.get("TIMEZONE", cls.timezone),
