@@ -1091,3 +1091,20 @@ def test_block_command_sends_ics_and_schedules_reminder(monkeypatch, tmp_path: P
     assert filename == "focus.ics" and b"SUMMARY:\xf0\x9f\x8e\xaf Focus : \xc3\xa9crire le rapport" in data
     assert "lundi 28/09 de 15:15 à 16:15" in caption
     assert jq.jobs and "écrire le rapport" in jarvis.store.reminders[0]["text"]
+
+
+def test_command_menu_is_valid_for_telegram(monkeypatch, tmp_path: Path):
+    import re
+
+    from jarvis.bot import menu_commands
+
+    jarvis = _coach(monkeypatch, tmp_path, AGENT_LOCAL="opencode run {prompt}", AGENT_CLAUDE="claude -p {prompt}")
+    app = jarvis.build_app()
+    registered = {c for h in app.handlers[0] for c in getattr(h, "commands", ())}
+    menu = menu_commands(jarvis.cfg.agents)
+    names = [c.command for c in menu]
+    assert len(menu) <= 100 and len(names) == len(set(names))
+    for c in menu:
+        assert re.fullmatch(r"[a-z0-9_]{1,32}", c.command) and 3 <= len(c.description) <= 256
+        assert c.command in registered, f"/{c.command} est dans le menu mais n'existe pas"
+    assert {"claude", "local"} <= set(names)

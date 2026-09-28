@@ -15,7 +15,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, PicklePersistence, filters
@@ -87,6 +87,53 @@ HELP = """🤖 Jarvis — tes commandes
 
 Tu peux aussi parler naturellement : « rappelle-moi dans 20 min de… », « souviens-toi que… »,
 « ajoute à ma liste … », « focus 45 min sur le rapport »."""
+
+
+# Menu « / » du téléphone : les commandes les plus utiles d'abord (Telegram en affiche 100 max).
+MENU = [
+    ("next", "La prochaine chose à faire"),
+    ("todo", "Ajouter à ma liste (! = urgent)"),
+    ("todos", "Voir ma liste"),
+    ("fait", "Cocher une tâche"),
+    ("focus", "Session de concentration (ex : 45 x2 rapport)"),
+    ("stopfocus", "Arrêter la session de concentration"),
+    ("decoupe", "Découper un gros objectif en étapes"),
+    ("plustard", "Repousser la tâche du moment"),
+    ("rappel", "Programmer un rappel (ex : demain à 9h …)"),
+    ("rappels", "Rappels prévus"),
+    ("habitudes", "Mes habitudes et séries"),
+    ("check", "Cocher une habitude"),
+    ("habitude", "Suivre une nouvelle habitude"),
+    ("agenda", "Mes rendez-vous (ou : demain)"),
+    ("bloquer", "Réserver un créneau de focus"),
+    ("bilan", "Bilan de ma journée"),
+    ("stats", "Graphique de ma semaine (ou 30)"),
+    ("briefing", "Météo, agenda et actus"),
+    ("do", "Faire faire une tâche par l'agent"),
+    ("suite", "Continuer la dernière tâche"),
+    ("taches", "Tâches de l'agent"),
+    ("log", "Journal d'une tâche"),
+    ("stop", "Arrêter une tâche"),
+    ("relancer", "Relancer une tâche"),
+    ("agent", "Voir ou changer d'agent"),
+    ("projet", "Changer de projet"),
+    ("get", "Recevoir un fichier du projet"),
+    ("web", "Chercher sur internet"),
+    ("ask", "Poser une question (sans action)"),
+    ("note", "Retenir une info sur moi"),
+    ("memoire", "Ce que Jarvis sait de moi"),
+    ("voix", "Réponses vocales : off, rappels, tout"),
+    ("etat", "État du PC et de l'IA"),
+    ("reset", "Oublier la conversation"),
+    ("aide", "Toutes les commandes"),
+]
+
+
+def menu_commands(agents: dict[str, str]) -> list[BotCommand]:
+    commands = [BotCommand(name, desc) for name, desc in MENU]
+    known = {name for name, _ in MENU}
+    commands += [BotCommand(a, f"Tâche avec l'agent {a}") for a in agents if a not in known]
+    return commands[:100]
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -582,6 +629,10 @@ class Jarvis(CoachMixin, LifeMixin):
 
     async def _on_startup(self, app: Application) -> None:
         self.restore_focus(app.job_queue)
+        try:
+            await app.bot.set_my_commands(menu_commands(self.cfg.agents))
+        except TelegramError:
+            log.warning("Menu des commandes non mis à jour")
         # Rappels : on reprogramme ceux à venir, on envoie ceux manqués pendant que le PC était éteint.
         now = self.now()
         for reminder in self.store.reminders:
